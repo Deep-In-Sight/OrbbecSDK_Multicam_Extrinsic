@@ -1,0 +1,859 @@
+#include "libobsensor/ObSensor.hpp"
+#include <opencv2/opencv.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/aruco.hpp>
+#include <Eigen/Dense>
+#include <Eigen/SVD>
+#include <fstream>
+#include <iostream>
+#include <cmath>
+#include <vector>
+#include <map>
+#include <set>
+#include <thread>
+#include <chrono>
+
+using namespace std;
+using namespace cv;
+using namespace Eigen;
+
+// ArUco 마커 파라미터
+const int ARUCO_DICT_ID = 16;  // DICT_16H5
+const float ARUCO_MARKER_SIZE = 30.0f; // mm
+const int EXPECTED_MARKERS = 4;  // 4개의 마커 (ID: 0,1,2,3)
+
+struct PointCloudData {
+    vector<OBColorPoint> points;
+    string deviceSerial;
+    Mat colorImage;
+    vector<Point2f> arucoCorners;  // ArUco 마커의 4개 코너
+    vector<int> arucoIds;          // ArUco 마커 ID들
+    bool arucoFound;               // ArUco 마커 검출 여부
+    vector<Point2f> planeCorners;  // 평면의 4개 코너 (마커 중심점들)
+};
+
+struct TransformationResult {
+    Matrix4d transformMatrix;
+    string sourceDevice;
+    string targetDevice;
+    double rmse;
+};
+
+// 색상 포인트 클라우드를 PLY 파일로 저장
+void saveRGBPointsToPly(const vector<OBColorPoint>& points, const string& fileName) {
+    FILE *fp = fopen(fileName.c_str(), "wb+");
+    if(!fp) {
+        throw std::runtime_error("Failed to open file for writing");
+    }
+
+    // 유효한 포인트만 카운트
+    int validPointsCount = 0;
+    static const auto min_distance = 1e-6;
+    for(const auto& point : points) {
+        if(fabs(point.x) >= min_distance || fabs(point.y) >= min_distance || fabs(point.z) >= min_distance) {
+            validPointsCount++;
+        }
+    }
+
+    // PLY 헤더 작성
+    fprintf(fp, "ply\n");
+    fprintf(fp, "format ascii 1.0\n");
+    fprintf(fp, "element vertex %d\n", validPointsCount);
+    fprintf(fp, "property float x\n");
+    fprintf(fp, "property float y\n");
+    fprintf(fp, "property float z\n");
+    fprintf(fp, "property uchar red\n");
+    fprintf(fp, "property uchar green\n");
+    fprintf(fp, "property uchar blue\n");
+    fprintf(fp, "end_header\n");
+
+    // 유효한 포인트 작성
+    for(const auto& point : points) {
+        if(fabs(point.x) >= min_distance || fabs(point.y) >= min_distance || fabs(point.z) >= min_distance) {
+            fprintf(fp, "%.3f %.3f %.3f %d %d %d\n", 
+                    point.x, point.y, point.z, 
+                    (int)point.r, (int)point.g, (int)point.b);
+        }
+    }
+
+    fflush(fp);
+    fclose(fp);
+}
+
+// ArUco 마커 검출 함수
+bool detectArUcoMarkers(const Mat& image, vector<Point2f>& corners, vector<int>& ids, 
+                        vector<Point2f>& planeCorners, bool visualize = false) {
+    Mat gray;
+    std::cout << "image.channels() : " << image.channels() << std::endl;
+    if(image.channels() == 3) {
+        cvtColor(image, gray, COLOR_BGR2GRAY);
+    } else {
+        gray = image;
+    }
+    std::cout << "gray.channels() : " << gray.channels() << std::endl;
+    
+    // ArUco 딕셔너리 생성
+    Ptr<aruco::Dictionary> dictionary = aruco::getPredefinedDictionary(aruco::PREDEFINED_DICTIONARY_NAME(ARUCO_DICT_ID));
+    Ptr<aruco::DetectorParameters> parameters = aruco::DetectorParameters::create();
+    
+    // 마커 검출
+    vector<vector<Point2f>> markerCorners;
+    aruco::detectMarkers(gray, dictionary, markerCorners, ids, parameters);
+    
+    std::cout << "검출된 ArUco 마커 수: " << ids.size() << std::endl;
+    
+    if(ids.size() >= EXPECTED_MARKERS) {
+        // ID 0,1,2,3 순서로 정렬
+        vector<pair<int, vector<Point2f>>> markersWithIds;
+        for(size_t i = 0; i < ids.size(); i++) {
+            if(ids[i] >= 0 && ids[i] < EXPECTED_MARKERS) {
+                markersWithIds.push_back({ids[i], markerCorners[i]});
+            }
+        }
+        
+        if(markersWithIds.size() >= EXPECTED_MARKERS) {
+            // ID 순서로 정렬 (pair의 first인 ID로 정렬)
+            sort(markersWithIds.begin(), markersWithIds.end(), 
+                 [](const pair<int, vector<Point2f>>& a, const pair<int, vector<Point2f>>& b) {
+                     return a.first < b.first;
+                 });
+            
+            // 모든 마커의 코너를 corners에 추가
+            corners.clear();
+            planeCorners.clear();
+            
+            for(const auto& marker : markersWithIds) {
+                // 마커의 4개 코너 추가
+                corners.insert(corners.end(), marker.second.begin(), marker.second.end());
+                
+                // 마커 중심점 계산 (평면 코너로 사용)
+                Point2f center(0, 0);
+                for(const auto& corner : marker.second) {
+                    center += corner;
+                }
+                center /= 4.0f;
+                planeCorners.push_back(center);
+            }
+            
+            if(visualize) {
+                Mat vis = image.clone();
+                aruco::drawDetectedMarkers(vis, markerCorners, ids);
+                
+                // 평면 코너 표시
+                for(size_t i = 0; i < planeCorners.size(); i++) {
+                    circle(vis, planeCorners[i], 10, Scalar(0, 255, 0), 2);
+                    putText(vis, to_string(i), planeCorners[i] + Point2f(15, 15), 
+                           FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 255, 0), 2);
+                }
+                
+                imshow("ArUco Marker Detection", vis);
+                waitKey(1000);
+            }
+            
+            std::cout << "ArUco 마커 검출 성공! 마커 수: " << markersWithIds.size() << std::endl;
+            return true;
+        }
+    }
+    
+    std::cout << "ArUco 마커 검출 실패! 예상 마커 수: " << EXPECTED_MARKERS << ", 실제: " << ids.size() << std::endl;
+    return false;
+}
+
+// ArUco 마커 중심점의 3D 좌표 추출
+vector<Vector3d> getArUcoCenterPoints(const vector<OBColorPoint>& pointCloud,
+                                      const vector<Point2f>& planeCorners,
+                                      uint32_t imageWidth, uint32_t imageHeight) {
+    vector<Vector3d> points3D;
+    
+    if(planeCorners.size() != EXPECTED_MARKERS) {
+        std::cout << "마커 중심점의 개수가 예상과 다릅니다!" << std::endl;
+        return points3D;
+    }
+
+    for (const auto& corner : planeCorners) {
+        int u = static_cast<int>(round(corner.x));
+        int v = static_cast<int>(round(corner.y));
+
+        if (u >= 0 && u < imageWidth && v >= 0 && v < imageHeight) {
+            int idx = v * imageWidth + u;
+            if (idx < pointCloud.size()) {
+                const auto& p = pointCloud[idx];
+                if (p.z > 0) { // 유효한 depth 값
+                    points3D.push_back(Vector3d(p.x, p.y, p.z));
+                }
+            }
+        }
+    }
+
+    std::cout << "추출된 ArUco 중심점 3D 좌표 수: " << points3D.size() << std::endl;
+    return points3D;
+}
+
+// SVD를 사용하여 변환 행렬 계산
+Matrix4d computeTransformationSVD(const vector<Vector3d>& sourcePoints,
+                                  const vector<Vector3d>& targetPoints) {
+    if(sourcePoints.size() != targetPoints.size() || sourcePoints.size() < 3) {
+        throw runtime_error("Invalid point sets for transformation computation");
+    }
+
+    // 중심점 계산
+    Vector3d sourceCentroid = Vector3d::Zero();
+    Vector3d targetCentroid = Vector3d::Zero();
+    
+    for(size_t i = 0; i < sourcePoints.size(); i++) {
+        sourceCentroid += sourcePoints[i];
+        targetCentroid += targetPoints[i];
+    }
+    sourceCentroid /= sourcePoints.size();
+    targetCentroid /= targetPoints.size();
+
+    // 중심 이동된 점들
+    MatrixXd sourceC(3, sourcePoints.size());
+    MatrixXd targetC(3, sourcePoints.size());
+    
+    for(size_t i = 0; i < sourcePoints.size(); i++) {
+        sourceC.col(i) = sourcePoints[i] - sourceCentroid;
+        targetC.col(i) = targetPoints[i] - targetCentroid;
+    }
+
+    // SVD를 사용한 회전 행렬 계산
+    Matrix3d H = sourceC * targetC.transpose();
+    JacobiSVD<Matrix3d> svd(H, ComputeFullU | ComputeFullV);
+    Matrix3d R = svd.matrixV() * svd.matrixU().transpose();
+
+    // 반사 보정
+    if(R.determinant() < 0) {
+        Matrix3d V = svd.matrixV();
+        V.col(2) *= -1;
+        R = V * svd.matrixU().transpose();
+    }
+
+    // 이동 벡터 계산
+    Vector3d t = targetCentroid - R * sourceCentroid;
+
+    // 4x4 변환 행렬 구성
+    Matrix4d T = Matrix4d::Identity();
+    T.block<3, 3>(0, 0) = R;
+    T.block<3, 1>(0, 3) = t;
+
+    return T;
+}
+
+// 안정적인 프레임셋 획득 함수
+shared_ptr<ob::FrameSet> getStableFrameset(shared_ptr<ob::Pipeline>& pipeline, 
+                                          int maxRetries = 10, 
+                                          int timeoutMs = 2000) {  // 타임아웃을 2초로 증가
+    shared_ptr<ob::FrameSet> frameset = nullptr;
+    int retries = 0;
+    bool hasDepth = false;
+    bool hasColor = false;
+    
+    cout << "프레임셋 획득 시작 (최대 " << maxRetries << "회 시도, 타임아웃: " << timeoutMs << "ms)" << endl;
+    
+    while(retries < maxRetries) {
+        try {
+            frameset = pipeline->waitForFrames(timeoutMs);
+            
+            if(frameset) {
+                // 각 프레임 상태 체크
+                hasDepth = (frameset->depthFrame() != nullptr);
+                hasColor = (frameset->colorFrame() != nullptr);
+                
+                cout << "[시도 " << (retries + 1) << "] ";
+                cout << "Depth: " << (hasDepth ? "OK" : "NO") << ", ";
+                cout << "Color: " << (hasColor ? "OK" : "NO");
+                
+                if(hasDepth && hasColor) {
+                    // 프레임 데이터 유효성 검사
+                    auto depthFrame = frameset->depthFrame();
+                    auto colorFrame = frameset->colorFrame();
+                    
+                    uint32_t depthSize = depthFrame->dataSize();
+                    uint32_t colorSize = colorFrame->dataSize();
+                    
+                    cout << " | Depth size: " << depthSize << ", Color size: " << colorSize << endl;
+                    
+                    if(depthSize > 0 && colorSize > 0) {
+                        cout << "프레임셋 획득 성공!" << endl;
+                        return frameset;
+                    } else {
+                        cout << " - 데이터 크기가 0입니다." << endl;
+                    }
+                } else {
+                    cout << " - 일부 프레임이 누락되었습니다." << endl;
+                }
+            } else {
+                cout << "[시도 " << (retries + 1) << "] 프레임셋이 null입니다." << endl;
+            }
+        }
+        catch(ob::Error &e) {
+            cout << "[오류] " << e.getMessage() << endl;
+        }
+        catch(exception &e) {
+            cout << "[예외] " << e.what() << endl;
+        }
+        
+        retries++;
+        if(retries < maxRetries) {
+            cout << "재시도 전 대기 중... (500ms)" << endl;
+            this_thread::sleep_for(chrono::milliseconds(500));
+        }
+    }
+    
+    cout << "프레임셋 획득 실패 (최대 재시도 횟수 초과)" << endl;
+    return nullptr;
+}
+
+// 단일 디바이스 처리 함수
+PointCloudData processSingleDevice(shared_ptr<ob::Device> device, 
+                                  const vector<int>& meanFrameNums,
+                                  bool saveFiles = true) {
+    PointCloudData result;
+    
+    auto deviceInfo = device->getDeviceInfo();
+    result.deviceSerial = string(deviceInfo->serialNumber());
+    
+    cout << "\n=== 디바이스 처리 중: " << result.deviceSerial << " ===" << endl;
+    
+    // 파이프라인 생성
+    auto pipeline = make_shared<ob::Pipeline>(device);
+    
+    // 스트림 설정
+    auto config = make_shared<ob::Config>();
+
+    std::shared_ptr<ob::VideoStreamProfile> colorProfile = nullptr;
+    
+    try {
+        // Get all stream profiles of the color camera, including stream resolution, frame rate, and frame format
+        auto colorProfiles = pipeline->getStreamProfileList(OB_SENSOR_COLOR);
+        if(colorProfiles) {
+            auto profile = colorProfiles->getProfile(OB_PROFILE_DEFAULT);
+            colorProfile = profile->as<ob::VideoStreamProfile>();
+        }
+        config->enableStream(colorProfile);
+    }
+    catch(ob::Error &e) {
+        config->setAlignMode(ALIGN_DISABLE);
+        std::cerr << "Current device is not support color sensor!" << std::endl;
+    }
+
+    // Get all stream profiles of the depth camera, including stream resolution, frame rate, and frame format
+    std::shared_ptr<ob::StreamProfileList> depthProfileList;
+    OBAlignMode                            alignMode = ALIGN_DISABLE;
+    if(colorProfile) {
+        // Try find supported depth to color align hardware mode profile
+        depthProfileList = pipeline->getD2CDepthProfileList(colorProfile, ALIGN_D2C_HW_MODE);
+        if(depthProfileList->count() > 0) {
+            alignMode = ALIGN_D2C_HW_MODE;
+        }
+        else {
+            // Try find supported depth to color align software mode profile
+            depthProfileList = pipeline->getD2CDepthProfileList(colorProfile, ALIGN_D2C_SW_MODE);
+            if(depthProfileList->count() > 0) {
+                alignMode = ALIGN_D2C_SW_MODE;
+            }
+        }
+
+        try {
+            // Enable frame synchronization
+            pipeline->enableFrameSync();
+        }
+        catch(ob::Error &e) {
+            std::cerr << "Current device is not support frame sync!" << std::endl;
+        }
+    }
+    else {
+        depthProfileList = pipeline->getStreamProfileList(OB_SENSOR_DEPTH);
+    }
+
+
+    if(depthProfileList->count() > 0) {
+        std::shared_ptr<ob::StreamProfile> depthProfile;
+        try {
+            // Select the profile with the same frame rate as color.
+            if(colorProfile) {
+                depthProfile = depthProfileList->getVideoStreamProfile(OB_WIDTH_ANY, OB_HEIGHT_ANY, OB_FORMAT_ANY, colorProfile->fps());
+            }
+        }
+        catch(...) {
+            depthProfile = nullptr;
+        }
+
+        if(!depthProfile) {
+            // If no matching profile is found, select the default profile.
+            depthProfile = depthProfileList->getProfile(OB_PROFILE_DEFAULT);
+        }
+        config->enableStream(depthProfile);
+    }
+    
+    /*
+    // 컬러 스트림 설정
+    shared_ptr<ob::VideoStreamProfile> colorProfile = nullptr;
+    try {
+        auto colorProfiles = pipeline->getStreamProfileList(OB_SENSOR_COLOR);
+        if(colorProfiles && colorProfiles->count() > 0) {
+            colorProfile = colorProfiles->getVideoStreamProfile(1280, 0, OB_FORMAT_RGB, 30);
+            if(!colorProfile) {
+                auto profile = colorProfiles->getProfile(OB_PROFILE_DEFAULT);
+                colorProfile = profile->as<ob::VideoStreamProfile>();
+            }
+        }
+        if(colorProfile) {
+            config->enableStream(colorProfile);
+        }
+    }
+    catch(ob::Error &e) {
+        cerr << "컬러 센서를 지원하지 않습니다!" << endl;
+        return result;
+    }*/
+
+    /*
+    // Depth 스트림 설정
+    shared_ptr<ob::StreamProfileList> depthProfileList;
+    OBAlignMode alignMode = ALIGN_DISABLE;
+    
+    if(colorProfile) {
+        // D2C 정렬 모드 시도
+        depthProfileList = pipeline->getD2CDepthProfileList(colorProfile, ALIGN_D2C_HW_MODE);
+        if(depthProfileList && depthProfileList->count() > 0) {
+            alignMode = ALIGN_D2C_HW_MODE;
+        } else {
+            depthProfileList = pipeline->getD2CDepthProfileList(colorProfile, ALIGN_D2C_SW_MODE);
+            if(depthProfileList && depthProfileList->count() > 0) {
+                alignMode = ALIGN_D2C_SW_MODE;
+            }
+        }
+    } else {
+        depthProfileList = pipeline->getStreamProfileList(OB_SENSOR_DEPTH);
+    }
+    
+    if(depthProfileList && depthProfileList->count() > 0) {
+        auto depthProfile = depthProfileList->getProfile(OB_PROFILE_DEFAULT);
+        config->enableStream(depthProfile);
+    }
+    */
+    config->setAlignMode(alignMode);
+    
+    // 파이프라인 시작
+    pipeline->start(config);
+    
+    // 워밍업
+    cout << "디바이스 워밍업 중..." << endl;
+    this_thread::sleep_for(chrono::milliseconds(2000));
+    
+    // 초기 프레임 획득 (안정적인 함수 사용)
+    cout << "\n초기 프레임 획득 중..." << endl;
+    shared_ptr<ob::FrameSet> init_frameset = getStableFrameset(pipeline, 20, 3000);  // 재시도 횟수와 타임아웃 증가
+    
+    if(!init_frameset || !init_frameset->depthFrame() || !init_frameset->colorFrame()) {
+        cerr << "초기 프레임 획득 실패! 디바이스를 확인하세요." << endl;
+        pipeline->stop();
+        return result;
+    }
+    
+    cout << "초기 프레임 획득 성공!" << endl;
+    
+    // 포인트 클라우드 필터 생성
+    auto pointCloudFilter = make_shared<ob::PointCloudFilter>();
+    auto cameraParam = pipeline->getCameraParam();
+    pointCloudFilter->setCameraParam(cameraParam);
+    
+    auto init_depth_frame = init_frameset->depthFrame();
+    auto init_color_frame = init_frameset->colorFrame();
+    
+    const uint32_t depth_width = init_depth_frame->width();
+    const uint32_t depth_height = init_depth_frame->height();
+    const uint32_t depth_size = depth_width * depth_height;
+    const uint32_t color_width = init_color_frame->width();
+    const uint32_t color_height = init_color_frame->height();
+    
+    // 프레임 정보 디버그 출력
+    cout << "Color frame info: " << color_width << "x" << color_height << endl;
+    cout << "Color frame format: " << init_color_frame->format() << endl;
+    cout << "Color frame data size: " << init_color_frame->dataSize() << endl;
+    
+    // 컬러 이미지를 OpenCV Mat으로 변환
+    // 포맷에 따라 적절한 변환 수행
+    if(init_color_frame->format() == OB_FORMAT_RGB) {
+        result.colorImage = Mat(color_height, color_width, CV_8UC3, init_color_frame->data()).clone();
+        cvtColor(result.colorImage, result.colorImage, COLOR_RGB2BGR);
+    } else if(init_color_frame->format() == OB_FORMAT_BGR) {
+        result.colorImage = Mat(color_height, color_width, CV_8UC3, init_color_frame->data()).clone();
+    } else if(init_color_frame->format() == OB_FORMAT_YUYV) {
+        Mat yuyv_image(color_height, color_width, CV_8UC2, init_color_frame->data());
+        cvtColor(yuyv_image, result.colorImage, COLOR_YUV2BGR_YUYV);
+    } else if(init_color_frame->format() == OB_FORMAT_I420) {
+        Mat yuv_image(color_height * 3 / 2, color_width, CV_8UC1, init_color_frame->data());
+        cvtColor(yuv_image, result.colorImage, COLOR_YUV2BGR_I420);
+    } else if(init_color_frame->format() == OB_FORMAT_MJPG) {
+        // MJPEG 디코딩
+        vector<uint8_t> mjpeg_data((uint8_t*)init_color_frame->data(), 
+                                   (uint8_t*)init_color_frame->data() + init_color_frame->dataSize());
+        result.colorImage = imdecode(mjpeg_data, IMREAD_COLOR);
+        if(result.colorImage.empty()) {
+            cerr << "Failed to decode MJPEG frame!" << endl;
+            pipeline->stop();
+            return result;
+        }
+    } else {
+        cerr << "Unsupported color format: " << init_color_frame->format() << endl;
+        pipeline->stop();
+        return result;
+    }
+    
+    cout << "Mat created successfully with size: " << result.colorImage.cols << "x" << result.colorImage.rows << endl;
+    
+    // ArUco 마커 검출
+    cout << "ArUco 마커 검출 중..." << endl;
+    result.arucoFound = detectArUcoMarkers(result.colorImage, result.arucoCorners, 
+                                         result.arucoIds, result.planeCorners, true);
+    
+    if(result.arucoFound) {
+        cout << "ArUco 마커 검출 성공! 마커 수: " << result.arucoIds.size() << endl;
+        cout << "검출된 마커 ID: ";
+        for(int id : result.arucoIds) {
+            cout << id << " ";
+        }
+        cout << endl;
+    } else {
+        cout << "ArUco 마커를 찾을 수 없습니다." << endl;
+    }
+    
+    // 여러 프레임 수로 평균 계산
+    map<int, vector<uint64_t>> depth_sums;
+    map<int, vector<uint64_t>> depth_sum_sqs;
+    map<int, vector<uint16_t>> depth_counts;
+    
+    for(int frameNum : meanFrameNums) {
+        depth_sums[frameNum].resize(depth_size, 0);
+        depth_sum_sqs[frameNum].resize(depth_size, 0);
+        depth_counts[frameNum].resize(depth_size, 0);
+    }
+    
+    // 최대 프레임 수만큼 수집
+    int maxFrames = *max_element(meanFrameNums.begin(), meanFrameNums.end());
+    cout << "프레임 수집 중 (최대 " << maxFrames << " 프레임)..." << endl;
+    
+    int collected = 0;
+    while(collected < maxFrames) {
+        auto frameset = pipeline->waitForFrames(100);
+        if(frameset && frameset->depthFrame()) {
+            auto depth_frame = frameset->depthFrame();
+            if(depth_frame->width() == depth_width && depth_frame->height() == depth_height) {
+                const uint16_t* depth_data = (const uint16_t*)depth_frame->data();
+                
+                for(auto frameNum : meanFrameNums) {
+                    if(collected < frameNum) {
+                        for(uint32_t i = 0; i < depth_size; i++) {
+                            if(depth_data[i] > 0) {
+                                depth_sums[frameNum][i] += depth_data[i];
+                                depth_sum_sqs[frameNum][i] += (uint64_t)depth_data[i] * depth_data[i];
+                                depth_counts[frameNum][i]++;
+                            }
+                        }
+                    }
+                }
+                collected++;
+                
+                if(collected % 10 == 0) {
+                    cout << "수집된 프레임: " << collected << "/" << maxFrames << endl;
+                }
+            }
+        }
+    }
+    
+    // 각 프레임 수에 대한 평균 depth 계산 및 포인트 클라우드 생성
+    for(int frameNum : meanFrameNums) {
+        cout << frameNum << " 프레임 평균 계산 중..." << endl;
+        
+        // 템플릿 프레임셋 획득 (안정적인 함수 사용)
+        shared_ptr<ob::FrameSet> target_frameset = getStableFrameset(pipeline, 5, 2000);
+        
+        if(!target_frameset) {
+            cout << "템플릿 프레임 획득 실패, 건너뜀..." << endl;
+            continue;
+        }
+        
+        // 평균 depth 계산
+        uint16_t* out_depth_data = (uint16_t*)target_frameset->depthFrame()->data();
+        for(uint32_t i = 0; i < depth_size; i++) {
+            if(depth_counts[frameNum][i] > 0) {
+                double mean = (double)depth_sums[frameNum][i] / depth_counts[frameNum][i];
+                double variance = (double)depth_sum_sqs[frameNum][i] / depth_counts[frameNum][i] - mean * mean;
+                double std_dev = sqrt(max(0.0, variance));
+                
+                // 표준편차가 평균의 20% 이하인 경우만 유효
+                if(std_dev < (mean * 0.2)) {
+                    out_depth_data[i] = (uint16_t)round(mean);
+                } else {
+                    out_depth_data[i] = 0;
+                }
+            } else {
+                out_depth_data[i] = 0;
+            }
+        }
+        
+        // 포인트 클라우드 생성 (depth만 사용)
+        auto depthValueScale = target_frameset->depthFrame()->getValueScale();
+        pointCloudFilter->setPositionDataScaled(depthValueScale);
+        pointCloudFilter->setCreatePointFormat(OB_FORMAT_POINT);  // RGB 없이 포인트만 생성
+        
+        // depth 프레임만으로 포인트 클라우드 생성
+        auto pcFrame = pointCloudFilter->process(target_frameset->depthFrame());
+        if(pcFrame) {
+            OBPoint3f* points3D = (OBPoint3f*)pcFrame->data();
+            int pointCount = pcFrame->dataSize() / sizeof(OBPoint3f);
+            
+            // 포인트를 result에 추가 (중복 제거를 위한 set 사용)
+            set<tuple<float, float, float>> uniquePoints;
+            for(int i = 0; i < pointCount; i++) {
+                if(points3D[i].z > 0) {
+                    auto key = make_tuple(
+                        round(points3D[i].x * 100) / 100,  // 0.01mm 정밀도로 반올림
+                        round(points3D[i].y * 100) / 100,
+                        round(points3D[i].z * 100) / 100
+                    );
+                    
+                    if(uniquePoints.find(key) == uniquePoints.end()) {
+                        uniquePoints.insert(key);
+                        
+                        // OBColorPoint 생성 (컬러 정보 추가)
+                        OBColorPoint colorPoint;
+                        colorPoint.x = points3D[i].x;
+                        colorPoint.y = points3D[i].y;
+                        colorPoint.z = points3D[i].z;
+                        
+                        // 이미지 좌표 계산 (카메라 파라미터 사용)
+                        int img_x = (i % depth_width) * color_width / depth_width;
+                        int img_y = (i / depth_width) * color_height / depth_height;
+                        
+                        if(img_x >= 0 && img_x < color_width && img_y >= 0 && img_y < color_height) {
+                            Vec3b color = result.colorImage.at<Vec3b>(img_y, img_x);
+                            colorPoint.b = color[0];
+                            colorPoint.g = color[1];
+                            colorPoint.r = color[2];
+                        } else {
+                            colorPoint.r = colorPoint.g = colorPoint.b = 255;
+                        }
+                        
+                        result.points.push_back(colorPoint);
+                    }
+                }
+            }
+        }
+    }
+    
+    cout << "총 포인트 수: " << result.points.size() << endl;
+    
+    // 파일 저장
+    if(saveFiles && !result.points.empty()) {
+        string filename = "MeanPointCloud_" + result.deviceSerial + ".ply";
+        saveRGBPointsToPly(result.points, filename);
+        cout << "포인트 클라우드 저장됨: " << filename << endl;
+        
+        // 컬러 이미지 저장
+        string imgFilename = "ColorImage_" + result.deviceSerial + ".png";
+        imwrite(imgFilename, result.colorImage);
+        cout << "컬러 이미지 저장됨: " << imgFilename << endl;
+    }
+    
+    pipeline->stop();
+    return result;
+}
+
+// 메인 함수
+int main(int argc, char **argv) try {
+    ob::Context ctx;
+    ctx.setLoggerSeverity(OB_LOG_SEVERITY_WARN);
+    
+    // 디바이스 목록 획득
+    auto devList = ctx.queryDeviceList();
+    uint32_t deviceCount = devList->deviceCount();
+    
+    if(deviceCount == 0) {
+        cerr << "연결된 디바이스가 없습니다!" << endl;
+        return -1;
+    }
+    
+    cout << "\n=== Orbbec 체커보드 캘리브레이션 시스템 ===" << endl;
+    cout << "발견된 디바이스 수: " << deviceCount << endl << endl;
+    
+    // 디바이스 목록 표시
+    for(uint32_t i = 0; i < deviceCount; i++) {
+        auto dev = devList->getDevice(i);
+        auto info = dev->getDeviceInfo();
+        cout << "[" << i << "] " << info->name() << " - Serial: " << info->serialNumber() << endl;
+    }
+    
+    // 평균을 계산할 프레임 수들
+    vector<int> meanFrameNums = {20, 30, 40};
+    
+    // 처리된 디바이스 데이터 저장
+    vector<PointCloudData> processedDevices;
+    
+    // 사용자 입력 루프
+    while(true) {
+        cout << "\n명령어:" << endl;
+        cout << "  [0-" << (deviceCount-1) << "] : 해당 인덱스의 디바이스 처리" << endl;
+        cout << "  a : 모든 디바이스 순차 처리" << endl;
+        cout << "  c : 수집된 데이터로 변환 행렬 계산" << endl;
+        cout << "  q : 종료" << endl;
+        cout << "선택: ";
+        
+        string input;
+        cin >> input;
+        
+        if(input == "q") {
+            break;
+        }
+        else if(input == "a") {
+            // 모든 디바이스 처리
+            processedDevices.clear();
+            for(uint32_t i = 0; i < deviceCount; i++) {
+                cout << "\n디바이스 " << i << " 처리 시작..." << endl;
+                auto dev = devList->getDevice(i);
+                auto data = processSingleDevice(dev, meanFrameNums);
+                processedDevices.push_back(data);
+                
+                // 디바이스 간 딜레이
+                this_thread::sleep_for(chrono::milliseconds(200));
+            }
+            cout << "\n모든 디바이스 처리 완료!" << endl;
+        }
+        else if(input == "c") {
+            // 변환 행렬 계산
+            if(processedDevices.size() < 2) {
+                cout << "최소 2개의 디바이스 데이터가 필요합니다!" << endl;
+                continue;
+            }
+            
+            // ArUco 마커가 검출된 디바이스만 필터링
+            vector<PointCloudData> validDevices;
+            for(const auto& data : processedDevices) {
+                if(data.arucoFound) {
+                    validDevices.push_back(data);
+                }
+            }
+            
+            if(validDevices.size() < 2) {
+                cout << "ArUco 마커가 검출된 디바이스가 2개 이상 필요합니다!" << endl;
+                continue;
+            }
+            
+            cout << "\n=== 변환 행렬 계산 ===" << endl;
+            
+            // 첫 번째 디바이스를 기준으로 설정
+            const auto& referenceDevice = validDevices[0];
+            cout << "기준 디바이스: " << referenceDevice.deviceSerial << endl;
+            
+            // 기준 디바이스의 ArUco 마커 영역 3D 포인트 추출
+            auto refPoints3D = getArUcoCenterPoints(
+                referenceDevice.points,
+                referenceDevice.planeCorners,
+                referenceDevice.colorImage.cols,
+                referenceDevice.colorImage.rows
+            );
+            
+            // 다른 디바이스들과의 변환 행렬 계산
+            for(size_t i = 1; i < validDevices.size(); i++) {
+                const auto& targetDevice = validDevices[i];
+                cout << "\n대상 디바이스: " << targetDevice.deviceSerial << endl;
+                
+                // 대상 디바이스의 ArUco 마커 영역 3D 포인트 추출
+                auto targetPoints3D = getArUcoCenterPoints(
+                    targetDevice.points,
+                    targetDevice.planeCorners,
+                    targetDevice.colorImage.cols,
+                    targetDevice.colorImage.rows
+                );
+                
+                if(refPoints3D.size() != EXPECTED_MARKERS) {
+                    cout << "경고: 기준 디바이스의 마커 3D 포인트를 모두 추출하지 못했습니다! (필요: " << EXPECTED_MARKERS << ", 실제: " << refPoints3D.size() << "개)" << endl;
+                    continue;
+                }
+                
+                if(targetPoints3D.size() != EXPECTED_MARKERS) {
+                    cout << "경고: 대상 디바이스의 마커 3D 포인트를 모두 추출하지 못했습니다! (필요: " << EXPECTED_MARKERS << ", 실제: " << targetPoints3D.size() << "개)" << endl;
+                    continue;
+                }
+                
+                // SVD를 사용하여 변환 행렬 계산
+                Matrix4d T = computeTransformationSVD(targetPoints3D, refPoints3D);
+                
+                // 결과 출력
+                cout << "\n변환 행렬 (Target -> Reference):" << endl;
+                cout << T << endl;
+                
+                // RMSE 계산
+                double rmse = 0;
+                for(size_t j = 0; j < targetPoints3D.size(); j++) {
+                    Vector4d p(targetPoints3D[j](0), targetPoints3D[j](1), targetPoints3D[j](2), 1);
+                    Vector4d transformed = T * p;
+                    Vector3d diff = transformed.head<3>() - refPoints3D[j];
+                    rmse += diff.squaredNorm();
+                }
+                rmse = sqrt(rmse / targetPoints3D.size());
+                cout << "RMSE: " << rmse << " mm" << endl;
+                
+                // 변환 행렬을 파일로 저장
+                string filename = "Transform_" + targetDevice.deviceSerial + "_to_" + 
+                                 referenceDevice.deviceSerial + ".txt";
+                ofstream file(filename);
+                if(file.is_open()) {
+                    file << "# Transformation Matrix from " << targetDevice.deviceSerial 
+                         << " to " << referenceDevice.deviceSerial << endl;
+                    file << "# RMSE: " << rmse << " mm" << endl;
+                    file << T << endl;
+                    file.close();
+                    cout << "변환 행렬 저장됨: " << filename << endl;
+                }
+            }
+        }
+        else {
+            // 개별 디바이스 처리
+            try {
+                int deviceIndex = stoi(input);
+                if(deviceIndex >= 0 && deviceIndex < deviceCount) {
+                    cout << "\n디바이스 " << deviceIndex << " 처리 시작..." << endl;
+                    auto dev = devList->getDevice(deviceIndex);
+                    auto data = processSingleDevice(dev, meanFrameNums);
+                    
+                    // 이미 처리된 디바이스인지 확인
+                    bool found = false;
+                    for(auto& pd : processedDevices) {
+                        if(pd.deviceSerial == data.deviceSerial) {
+                            pd = data;  // 업데이트
+                            found = true;
+                            break;
+                        }
+                    }
+                    if(!found) {
+                        processedDevices.push_back(data);
+                    }
+                    
+                    cout << "디바이스 " << deviceIndex << " 처리 완료!" << endl;
+                } else {
+                    cout << "잘못된 디바이스 인덱스입니다!" << endl;
+                }
+            }
+            catch(...) {
+                cout << "잘못된 입력입니다!" << endl;
+            }
+        }
+    }
+    
+    cout << "\n프로그램을 종료합니다." << endl;
+    return 0;
+}
+catch(ob::Error &e) {
+    cerr << "OrbbecSDK Error: " << e.getMessage() << endl;
+    cerr << "Function: " << e.getName() << endl;
+    cerr << "Args: " << e.getArgs() << endl;
+    cerr << "Type: " << e.getExceptionType() << endl;
+    return -1;
+}
+catch(exception &e) {
+    cerr << "Standard Exception: " << e.what() << endl;
+    return -1;
+}
