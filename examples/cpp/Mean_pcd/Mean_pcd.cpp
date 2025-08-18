@@ -14,9 +14,12 @@
 #include <thread>
 #include <chrono>
 
+#include <libobsensor/hpp/Utils.hpp>
+
 using namespace std;
 using namespace cv;
 using namespace Eigen;
+using namespace ob;
 
 // ArUco 마커 파라미터
 const int ARUCO_DICT_ID = 16;  // DICT_16H5
@@ -24,13 +27,16 @@ const float ARUCO_MARKER_SIZE = 30.0f; // mm
 const int EXPECTED_MARKERS = 4;  // 4개의 마커 (ID: 0,1,2,3)
 
 struct PointCloudData {
-    vector<OBColorPoint> points;
-    string deviceSerial;
-    Mat colorImage;
-    vector<Point2f> arucoCorners;  // ArUco 마커의 4개 코너
-    vector<int> arucoIds;          // ArUco 마커 ID들
-    bool arucoFound;               // ArUco 마커 검출 여부
-    vector<Point2f> planeCorners;  // 평면의 4개 코너 (마커 중심점들)
+    vector<OBColorPoint>      points;
+    vector<OBColorPoint>      regionPoints;  // ArUco 마커 영역 내의 포인트
+    string                    deviceSerial;
+    Mat                       colorImage;
+    vector<Point2f>           arucoCorners;  // ArUco 마커의 모든 코너
+    map<int, vector<Point2f>> arucoMarkerCorners;  // ArUco 마커별 코너
+    vector<Point2f>           regionDefiningCorners;  // 4개 마커로 정의된 영역의 코너
+    vector<int>               arucoIds;          // ArUco 마커 ID들
+    bool                      arucoFound;               // ArUco 마커 검출 여부
+    vector<Point2f>           planeCorners;  // 평면의 4개 코너 (마커 중심점들)
 };
 
 struct TransformationResult {
@@ -41,7 +47,7 @@ struct TransformationResult {
 };
 
 // 색상 포인트 클라우드를 PLY 파일로 저장
-void saveRGBPointsToPly(const vector<OBColorPoint>& points, const string& fileName) {
+void saveRGBPointsToPly(const vector<OBColorPoint> &points, const string &fileName) {
     FILE *fp = fopen(fileName.c_str(), "wb+");
     if(!fp) {
         throw std::runtime_error("Failed to open file for writing");
@@ -82,80 +88,86 @@ void saveRGBPointsToPly(const vector<OBColorPoint>& points, const string& fileNa
 }
 
 // ArUco 마커 검출 함수
-bool detectArUcoMarkers(const Mat& image, vector<Point2f>& corners, vector<int>& ids, 
-                        vector<Point2f>& planeCorners, bool visualize = false) {
+bool detectArUcoMarkers(const Mat &image, vector<Point2f> &corners, vector<int> &ids, vector<Point2f> &planeCorners,
+                        map<int, vector<Point2f>> &markerCornerMap, vector<Point2f> &regionCorners, bool visualize = false) {
     Mat gray;
-    std::cout << "image.channels() : " << image.channels() << std::endl;
     if(image.channels() == 3) {
         cvtColor(image, gray, COLOR_BGR2GRAY);
-    } else {
+    }
+    else {
         gray = image;
     }
-    std::cout << "gray.channels() : " << gray.channels() << std::endl;
-    
+
     // ArUco 딕셔너리 생성
-    Ptr<aruco::Dictionary> dictionary = aruco::getPredefinedDictionary(aruco::PREDEFINED_DICTIONARY_NAME(ARUCO_DICT_ID));
+    Ptr<aruco::Dictionary>       dictionary = aruco::getPredefinedDictionary(aruco::PREDEFINED_DICTIONARY_NAME(ARUCO_DICT_ID));
     Ptr<aruco::DetectorParameters> parameters = aruco::DetectorParameters::create();
-    
+
     // 마커 검출
-    vector<vector<Point2f>> markerCorners;
-    aruco::detectMarkers(gray, dictionary, markerCorners, ids, parameters);
-    
+    vector<vector<Point2f>> detectedCorners;
+    aruco::detectMarkers(gray, dictionary, detectedCorners, ids, parameters);
+
     std::cout << "검출된 ArUco 마커 수: " << ids.size() << std::endl;
-    
+
     if(ids.size() >= EXPECTED_MARKERS) {
-        // ID 0,1,2,3 순서로 정렬
         vector<pair<int, vector<Point2f>>> markersWithIds;
         for(size_t i = 0; i < ids.size(); i++) {
             if(ids[i] >= 0 && ids[i] < EXPECTED_MARKERS) {
-                markersWithIds.push_back({ids[i], markerCorners[i]});
+                markersWithIds.push_back({ ids[i], detectedCorners[i] });
             }
         }
-        
+
         if(markersWithIds.size() >= EXPECTED_MARKERS) {
-            // ID 순서로 정렬 (pair의 first인 ID로 정렬)
-            sort(markersWithIds.begin(), markersWithIds.end(), 
-                 [](const pair<int, vector<Point2f>>& a, const pair<int, vector<Point2f>>& b) {
-                     return a.first < b.first;
-                 });
-            
-            // 모든 마커의 코너를 corners에 추가
+            sort(markersWithIds.begin(), markersWithIds.end(), [](const pair<int, vector<Point2f>> &a, const pair<int, vector<Point2f>> &b) {
+                return a.first < b.first;
+            });
+
             corners.clear();
             planeCorners.clear();
-            
-            for(const auto& marker : markersWithIds) {
-                // 마커의 4개 코너 추가
+            markerCornerMap.clear();
+
+            for(const auto &marker: markersWithIds) {
                 corners.insert(corners.end(), marker.second.begin(), marker.second.end());
-                
-                // 마커 중심점 계산 (평면 코너로 사용)
+                markerCornerMap[marker.first] = marker.second;
+
                 Point2f center(0, 0);
-                for(const auto& corner : marker.second) {
+                for(const auto &corner: marker.second) {
                     center += corner;
                 }
                 center /= 4.0f;
                 planeCorners.push_back(center);
             }
-            
+
+            if(markerCornerMap.count(3) && markerCornerMap.count(2) && markerCornerMap.count(0) && markerCornerMap.count(1)) {
+                regionCorners.push_back(markerCornerMap[3][0]);  // TL from marker 3
+                regionCorners.push_back(markerCornerMap[2][1]);  // TR from marker 2
+                regionCorners.push_back(markerCornerMap[0][2]);  // BR from marker 0
+                regionCorners.push_back(markerCornerMap[1][3]);  // BL from marker 1
+            }
+
             if(visualize) {
                 Mat vis = image.clone();
-                aruco::drawDetectedMarkers(vis, markerCorners, ids);
-                
-                // 평면 코너 표시
+                aruco::drawDetectedMarkers(vis, detectedCorners, ids);
+
                 for(size_t i = 0; i < planeCorners.size(); i++) {
                     circle(vis, planeCorners[i], 10, Scalar(0, 255, 0), 2);
-                    putText(vis, to_string(i), planeCorners[i] + Point2f(15, 15), 
-                           FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 255, 0), 2);
+                    putText(vis, to_string(i), planeCorners[i] + Point2f(15, 15), FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 255, 0), 2);
                 }
-                
+
+                if(regionCorners.size() == 4) {
+                    for(size_t i = 0; i < regionCorners.size(); ++i) {
+                        line(vis, regionCorners[i], regionCorners[(i + 1) % 4], Scalar(255, 0, 0), 2);
+                    }
+                }
+
                 imshow("ArUco Marker Detection", vis);
                 waitKey(1000);
             }
-            
+
             std::cout << "ArUco 마커 검출 성공! 마커 수: " << markersWithIds.size() << std::endl;
             return true;
         }
     }
-    
+
     std::cout << "ArUco 마커 검출 실패! 예상 마커 수: " << EXPECTED_MARKERS << ", 실제: " << ids.size() << std::endl;
     return false;
 }
@@ -387,52 +399,6 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
         config->enableStream(depthProfile);
     }
     
-    /*
-    // 컬러 스트림 설정
-    shared_ptr<ob::VideoStreamProfile> colorProfile = nullptr;
-    try {
-        auto colorProfiles = pipeline->getStreamProfileList(OB_SENSOR_COLOR);
-        if(colorProfiles && colorProfiles->count() > 0) {
-            colorProfile = colorProfiles->getVideoStreamProfile(1280, 0, OB_FORMAT_RGB, 30);
-            if(!colorProfile) {
-                auto profile = colorProfiles->getProfile(OB_PROFILE_DEFAULT);
-                colorProfile = profile->as<ob::VideoStreamProfile>();
-            }
-        }
-        if(colorProfile) {
-            config->enableStream(colorProfile);
-        }
-    }
-    catch(ob::Error &e) {
-        cerr << "컬러 센서를 지원하지 않습니다!" << endl;
-        return result;
-    }*/
-
-    /*
-    // Depth 스트림 설정
-    shared_ptr<ob::StreamProfileList> depthProfileList;
-    OBAlignMode alignMode = ALIGN_DISABLE;
-    
-    if(colorProfile) {
-        // D2C 정렬 모드 시도
-        depthProfileList = pipeline->getD2CDepthProfileList(colorProfile, ALIGN_D2C_HW_MODE);
-        if(depthProfileList && depthProfileList->count() > 0) {
-            alignMode = ALIGN_D2C_HW_MODE;
-        } else {
-            depthProfileList = pipeline->getD2CDepthProfileList(colorProfile, ALIGN_D2C_SW_MODE);
-            if(depthProfileList && depthProfileList->count() > 0) {
-                alignMode = ALIGN_D2C_SW_MODE;
-            }
-        }
-    } else {
-        depthProfileList = pipeline->getStreamProfileList(OB_SENSOR_DEPTH);
-    }
-    
-    if(depthProfileList && depthProfileList->count() > 0) {
-        auto depthProfile = depthProfileList->getProfile(OB_PROFILE_DEFAULT);
-        config->enableStream(depthProfile);
-    }
-    */
     config->setAlignMode(alignMode);
     
     // 파이프라인 시작
@@ -440,7 +406,7 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
     
     // 워밍업
     cout << "디바이스 워밍업 중..." << endl;
-    this_thread::sleep_for(chrono::milliseconds(2000));
+    this_thread::sleep_for(chrono::milliseconds(1000));
     
     // 초기 프레임 획득 (안정적인 함수 사용)
     cout << "\n초기 프레임 획득 중..." << endl;
@@ -503,12 +469,12 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
     }
     
     cout << "Mat created successfully with size: " << result.colorImage.cols << "x" << result.colorImage.rows << endl;
-    
+
     // ArUco 마커 검출
     cout << "ArUco 마커 검출 중..." << endl;
-    result.arucoFound = detectArUcoMarkers(result.colorImage, result.arucoCorners, 
-                                         result.arucoIds, result.planeCorners, true);
-    
+    result.arucoFound = detectArUcoMarkers(result.colorImage, result.arucoCorners, result.arucoIds, result.planeCorners, result.arucoMarkerCorners,
+                                           result.regionDefiningCorners, true);
+
     if(result.arucoFound) {
         cout << "ArUco 마커 검출 성공! 마커 수: " << result.arucoIds.size() << endl;
         cout << "검출된 마커 ID: ";
@@ -589,7 +555,8 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
                 } else {
                     out_depth_data[i] = 0;
                 }
-            } else {
+            }
+            else {
                 out_depth_data[i] = 0;
             }
         }
@@ -644,14 +611,40 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
         }
     }
     
+    // ArUco 영역 내 포인트 필터링
+    if(result.arucoFound && result.regionDefiningCorners.size() == 4) {
+        auto calibParam = pipeline->getCalibrationParam(config);
+        for(const auto &p: result.points) {
+            if(p.z > 0) {
+                OBPoint2f colorPixel = { 0 };
+                CoordinateTransformHelper::calibration3dTo2d(calibParam, { p.x, p.y, p.z }, OB_SENSOR_DEPTH, OB_SENSOR_COLOR, &colorPixel);
+
+                if(colorPixel.x >= 0 && colorPixel.x < color_width && colorPixel.y >= 0 && colorPixel.y < color_height) {
+                    if(pointPolygonTest(result.regionDefiningCorners, Point2f(colorPixel.x, colorPixel.y), false) >= 0) {
+                        result.regionPoints.push_back(p);
+                    }
+                }
+            }
+        }
+    }
+
     cout << "총 포인트 수: " << result.points.size() << endl;
-    
+    if(!result.regionPoints.empty()) {
+        cout << "영역 내 포인트 수: " << result.regionPoints.size() << endl;
+    }
+
     // 파일 저장
     if(saveFiles && !result.points.empty()) {
         string filename = "MeanPointCloud_" + result.deviceSerial + ".ply";
         saveRGBPointsToPly(result.points, filename);
         cout << "포인트 클라우드 저장됨: " << filename << endl;
-        
+
+        if(!result.regionPoints.empty()) {
+            string regionFilename = "MeanPointCloud_Region_" + result.deviceSerial + ".ply";
+            saveRGBPointsToPly(result.regionPoints, regionFilename);
+            cout << "영역 포인트 클라우드 저장됨: " << regionFilename << endl;
+        }
+
         // 컬러 이미지 저장
         string imgFilename = "ColorImage_" + result.deviceSerial + ".png";
         imwrite(imgFilename, result.colorImage);
@@ -713,7 +706,7 @@ int main(int argc, char **argv) try {
             for(uint32_t i = 0; i < deviceCount; i++) {
                 cout << "\n디바이스 " << i << " 처리 시작..." << endl;
                 auto dev = devList->getDevice(i);
-                auto data = processSingleDevice(dev, meanFrameNums);
+                PointCloudData data = processSingleDevice(dev, meanFrameNums);
                 processedDevices.push_back(data);
                 
                 // 디바이스 간 딜레이
