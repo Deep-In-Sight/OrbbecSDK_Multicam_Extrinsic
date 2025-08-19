@@ -13,7 +13,14 @@
 #include <set>
 #include <thread>
 #include <chrono>
+#include <dirent.h>
+#include <random>
+#include <queue>
+#include <algorithm>
+#include <sstream>
+#include <cstdio>
 
+#include "cJSON.h"
 #include <libobsensor/hpp/Utils.hpp>
 
 using namespace std;
@@ -25,6 +32,341 @@ using namespace ob;
 const int ARUCO_DICT_ID = 16;  // DICT_16H5
 const float ARUCO_MARKER_SIZE = 30.0f; // mm
 const int EXPECTED_MARKERS = 4;  // 4개의 마커 (ID: 0,1,2,3)
+
+static inline string nowTimestamp() {
+	auto now      = std::chrono::system_clock::now();
+	time_t t      = std::chrono::system_clock::to_time_t(now);
+	struct tm tmv = {};
+	localtime_r(&t, &tmv);
+	char buf[32];
+	strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tmv);
+	return string(buf);
+}
+
+static inline double pointToPlaneDistance(const Vector3d &p, const Vector4d &plane) {
+	// plane: ax + by + cz + d = 0, normalized a^2+b^2+c^2=1
+	return fabs(plane.head<3>().dot(p) + plane(3));
+}
+
+static inline bool fitPlaneFrom3Points(const Vector3d &p1, const Vector3d &p2, const Vector3d &p3, Vector4d &planeOut) {
+	Vector3d v1 = p2 - p1;
+	Vector3d v2 = p3 - p1;
+	Vector3d n  = v1.cross(v2);
+	double    nrm = n.norm();
+	if(nrm < 1e-6) return false;
+	n.normalize();
+	double d = -n.dot(p1);
+	planeOut.head<3>() = n;
+	planeOut(3)        = d;
+	return true;
+}
+
+static inline void orderPolygonTLTRBRBL(vector<Point2f> &poly) {
+	// Ensure TL, TR, BR, BL order for convex quad
+	if(poly.size() != 4) return;
+	// compute centroid
+	Point2f c(0, 0);
+	for(const auto &p: poly) c += p;
+	c *= 0.25f;
+	// separate by angle
+	vector<pair<double, Point2f>> ang;
+	for(const auto &p: poly) {
+		double a = atan2(p.y - c.y, p.x - c.x);
+		ang.push_back({ a, p });
+	}
+	sort(ang.begin(), ang.end(), [](auto &a, auto &b) { return a.first < b.first; });
+	// angles: -pi..pi, we want TL(-135), TR(-45), BR(45), BL(135) if y-down image
+	// map by y then x heuristic
+	vector<Point2f> s;
+	for(auto &ap: ang) s.push_back(ap.second);
+	// reorder to TL, TR, BR, BL
+	// find top-most two (smallest y)
+	sort(s.begin(), s.end(), [](const Point2f &a, const Point2f &b) { return a.y < b.y || (a.y == b.y && a.x < b.x); });
+	Point2f TL = (s[0].x < s[1].x) ? s[0] : s[1];
+	Point2f TR = (s[0].x < s[1].x) ? s[1] : s[0];
+	// bottom two
+	Point2f BL = (s[2].x < s[3].x) ? s[2] : s[3];
+	Point2f BR = (s[2].x < s[3].x) ? s[3] : s[2];
+	poly.clear();
+	poly.push_back(TL);
+	poly.push_back(TR);
+	poly.push_back(BR);
+	poly.push_back(BL);
+}
+
+static vector<Point2f> computeInnerCorners(const map<int, vector<Point2f>> &markerCornerMap,
+                                           const vector<int>              &ids) {
+	// IDs expected: 0:TL, 1:TR, 2:BL, 3:BR
+	if(markerCornerMap.size() < 4) return {};
+	// marker centers
+	map<int, Point2f> markerCenters;
+	for(const auto &kv: markerCornerMap) {
+		Point2f c(0, 0);
+		for(const auto &p: kv.second) c += p;
+		c *= 0.25f;
+		markerCenters[kv.first] = c;
+	}
+	if(markerCenters.size() < 4) return {};
+	// global centroid
+	Point2f C(0, 0);
+	for(const auto &kv: markerCenters) C += kv.second;
+	C *= 0.25f;
+
+	auto pickInner = [&](int id) -> Point2f {
+		const auto &corners = markerCornerMap.at(id);
+		Point2f m           = markerCenters[id];
+		Point2f vin         = C - m;
+		double   vinNorm     = sqrt(vin.x * vin.x + vin.y * vin.y);
+		if(vinNorm < 1e-6) {
+			// fallback: nearest to centroid
+			double bestd = 1e18;
+			Point2f best = corners[0];
+			for(const auto &c: corners) {
+				double dx = C.x - c.x, dy = C.y - c.y;
+				double d2 = dx * dx + dy * dy;
+				if(d2 < bestd) {
+					bestd = d2;
+					best  = c;
+				}
+			}
+			return best;
+		}
+		vin.x /= vinNorm; vin.y /= vinNorm;
+		double bestDot = -1e18;
+		double bestD   = 1e18;
+		Point2f best  = corners[0];
+		for(const auto &c: corners) {
+			Point2f u = c - m;
+			double un = sqrt(u.x * u.x + u.y * u.y);
+			if(un < 1e-6) continue;
+			u.x /= un; u.y /= un;
+			double dprod = u.x * vin.x + u.y * vin.y; // alignment with inward direction
+			double dcen  = (C.x - c.x) * (C.x - c.x) + (C.y - c.y) * (C.y - c.y);
+			// prefer larger dot; tie-break by nearer to centroid
+			if(dprod > bestDot + 1e-6 || (fabs(dprod - bestDot) <= 1e-6 && dcen < bestD)) {
+				bestDot = dprod;
+				bestD   = dcen;
+				best    = c;
+			}
+		}
+		return best;
+	};
+
+	// assemble in TL, TR, BR, BL order from IDs 0,1,3,2
+	vector<Point2f> quad(4);
+	if(markerCornerMap.count(0) && markerCornerMap.count(1) && markerCornerMap.count(2) && markerCornerMap.count(3)) {
+		quad[0] = pickInner(0); // TL
+		quad[1] = pickInner(1); // TR
+		quad[2] = pickInner(3); // BR
+		quad[3] = pickInner(2); // BL
+		orderPolygonTLTRBRBL(quad);
+		return quad;
+	}
+	return {};
+}
+
+static Mat polygonMask(Size size, const vector<Point2f> &poly) {
+	Mat mask = Mat::zeros(size, CV_8U);
+	if(poly.size() != 4) return mask;
+	vector<Point> pts;
+	for(const auto &p: poly) pts.emplace_back(cvRound(p.x), cvRound(p.y));
+	const Point *pp = pts.data();
+	int          np = (int)pts.size();
+	fillPoly(mask, &pp, &np, 1, Scalar(255));
+	return mask;
+}
+
+// Depth->Color D2C 변환 폴백 (calibration2dTo2d를 이용해 직접 생성)
+static shared_ptr<ob::Frame> buildDepthD2CByCalibration(const OBCalibrationParam &param,
+	shared_ptr<ob::Frame> depthFrame,
+	uint32_t colorW,
+	uint32_t colorH) {
+	if(!depthFrame) return nullptr;
+	auto df = depthFrame->as<ob::DepthFrame>();
+	if(!df) return nullptr;
+	uint32_t dw = df->width();
+	uint32_t dh = df->height();
+	auto out = ob::FrameHelper::createFrame(OB_FRAME_DEPTH, df->format(), colorW, colorH, 0);
+	if(!out) return nullptr;
+	memset(out->data(), 0, colorW * colorH * 2);
+	auto outData = (uint16_t *)out->data();
+	const uint16_t *src = (const uint16_t *)df->data();
+	float valueScale = df->getValueScale();
+
+	// 더 견고한 경로: Depth 2D -> Depth 3D(undist) -> Color 2D
+	for(uint32_t y = 0; y < dh; ++y) {
+		for(uint32_t x = 0; x < dw; ++x) {
+			uint16_t dRaw = src[y * dw + x];
+			if(dRaw == 0) continue;
+			float dmm = dRaw * valueScale; // mm
+
+			OBPoint2f sp2d{ (float)x, (float)y };
+			OBPoint3f p3d{};
+			if(!ob::CoordinateTransformHelper::calibration2dTo3dUndistortion(param, sp2d, dmm, OB_SENSOR_DEPTH, OB_SENSOR_DEPTH, &p3d)) {
+				continue;
+			}
+			OBPoint2f tp2d{};
+			if(!ob::CoordinateTransformHelper::calibration3dTo2d(param, p3d, OB_SENSOR_DEPTH, OB_SENSOR_COLOR, &tp2d)) {
+				continue;
+			}
+			int u = (int)round(tp2d.x);
+			int v = (int)round(tp2d.y);
+			if(u < 0 || u >= (int)colorW || v < 0 || v >= (int)colorH) continue;
+			uint16_t &dst = outData[v * colorW + u];
+			if(dst == 0 || dRaw < dst) dst = dRaw; // z-buffer(가까운 깊이 유지)
+		}
+	}
+	return out;
+}
+
+// D2C 변환 함수는 직접 CoordinateTransformHelper 호출로 대체됨
+
+static bool ransacPlaneOnROI(const Mat &mask, shared_ptr<Frame> depthD2C, const OBCalibrationParam &param, Vector4d &bestPlane,
+                             Mat &inlierMask, int maxIters = 1000, double inlierThreshMm = 10.0) {
+	inlierMask = Mat::zeros(mask.size(), CV_8U);
+	int    W   = mask.cols, H = mask.rows;
+	auto  raw  = (uint16_t *)depthD2C->data();
+	if(!raw) return false;
+	vector<Point> candidates;
+	candidates.reserve(W * H);
+	for(int y = 0; y < H; ++y) {
+		const uchar *m = mask.ptr<uchar>(y);
+		for(int x = 0; x < W; ++x) {
+			if(m[x]) {
+				uint16_t d = raw[y * W + x];
+				if(d > 0) candidates.emplace_back(x, y);
+			}
+		}
+	}
+	if(candidates.size() < 100) return false;
+	std::mt19937 rng((uint32_t)time(nullptr));
+	std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+	int   bestInliers = -1;
+	bool  found       = false;
+	for(int it = 0; it < maxIters; ++it) {
+		// sample 3 distinct points
+		Point p1 = candidates[dist(rng)], p2 = candidates[dist(rng)], p3 = candidates[dist(rng)];
+		if(p1 == p2 || p1 == p3 || p2 == p3) { --it; continue; }
+		uint16_t d1 = raw[p1.y * W + p1.x], d2 = raw[p2.y * W + p2.x], d3 = raw[p3.y * W + p3.x];
+		if(d1 == 0 || d2 == 0 || d3 == 0) { --it; continue; }
+		OBPoint3f P1{}, P2{}, P3{};
+		OBPoint2f s1{ (float)p1.x, (float)p1.y }, s2{ (float)p2.x, (float)p2.y }, s3{ (float)p3.x, (float)p3.y };
+		CoordinateTransformHelper::calibration2dTo3d(param, s1, (float)d1, OB_SENSOR_COLOR, OB_SENSOR_COLOR, &P1);
+		CoordinateTransformHelper::calibration2dTo3d(param, s2, (float)d2, OB_SENSOR_COLOR, OB_SENSOR_COLOR, &P2);
+		CoordinateTransformHelper::calibration2dTo3d(param, s3, (float)d3, OB_SENSOR_COLOR, OB_SENSOR_COLOR, &P3);
+		Vector4d plane;
+		if(!fitPlaneFrom3Points({ P1.x, P1.y, P1.z }, { P2.x, P2.y, P2.z }, { P3.x, P3.y, P3.z }, plane)) continue;
+		int inliers = 0;
+		for(int k = 0; k < 500; ++k) { // subsample 500 pixels
+			size_t idx = dist(rng);
+			Point  p  = candidates[idx];
+			uint16_t d = raw[p.y * W + p.x];
+			if(d == 0) continue;
+			OBPoint3f P{};
+			OBPoint2f s{ (float)p.x, (float)p.y };
+			CoordinateTransformHelper::calibration2dTo3d(param, s, (float)d, OB_SENSOR_COLOR, OB_SENSOR_COLOR, &P);
+			if(pointToPlaneDistance({ P.x, P.y, P.z }, plane) <= inlierThreshMm) inliers++;
+		}
+		if(inliers > bestInliers) {
+			bestInliers = inliers;
+			bestPlane   = plane;
+			found       = true;
+		}
+	}
+	if(!found) return false;
+	// build full inlier mask
+	for(int y = 0; y < H; ++y) {
+		uchar *m = inlierMask.ptr<uchar>(y);
+		for(int x = 0; x < W; ++x) {
+			if(mask.at<uchar>(y, x) == 0) { m[x] = 0; continue; }
+			uint16_t d = raw[y * W + x];
+			if(d == 0) { m[x] = 0; continue; }
+			OBPoint3f P{};
+			OBPoint2f s{ (float)x, (float)y };
+			CoordinateTransformHelper::calibration2dTo3d(param, s, (float)d, OB_SENSOR_COLOR, OB_SENSOR_COLOR, &P);
+			m[x] = (pointToPlaneDistance({ P.x, P.y, P.z }, bestPlane) <= inlierThreshMm) ? 255 : 0;
+		}
+	}
+	return true;
+}
+
+static Mat floodPlaneByDepthEdge(const Mat &mask, shared_ptr<Frame> depthD2C, double edgeThreshMm = 50.0) {
+	int W = mask.cols, H = mask.rows;
+	Mat visited = Mat::zeros(H, W, CV_8U);
+	Mat out     = Mat::zeros(H, W, CV_8U);
+	auto raw    = (uint16_t *)depthD2C->data();
+	if(!raw) return out;
+	// seed: mask center
+	Moments mo = moments(mask, true);
+	Point   seed(mo.m10 / max(1.0, mo.m00), mo.m01 / max(1.0, mo.m00));
+	if(seed.x < 0 || seed.x >= W || seed.y < 0 || seed.y >= H) return out;
+	if(mask.at<uchar>(seed) == 0 || raw[seed.y * W + seed.x] == 0) return out;
+	uint16_t seedD = raw[seed.y * W + seed.x];
+	std::queue<Point> q;
+	q.push(seed);
+	visited.at<uchar>(seed) = 1;
+	out.at<uchar>(seed)      = 255;
+	auto inside = [&](int x, int y) { return x >= 0 && x < W && y >= 0 && y < H; };
+	const int dx[4] = { 1, -1, 0, 0 };
+	const int dy[4] = { 0, 0, 1, -1 };
+	while(!q.empty()) {
+		Point p = q.front(); q.pop();
+		uint16_t pd = raw[p.y * W + p.x];
+		for(int k = 0; k < 4; ++k) {
+			int nx = p.x + dx[k], ny = p.y + dy[k];
+			if(!inside(nx, ny)) continue;
+			if(visited.at<uchar>(ny, nx)) continue;
+			if(mask.at<uchar>(ny, nx) == 0) continue;
+			uint16_t nd = raw[ny * W + nx];
+			if(nd == 0) continue;
+			if(fabs((double)nd - (double)pd) <= edgeThreshMm) {
+				visited.at<uchar>(ny, nx) = 1;
+				out.at<uchar>(ny, nx)      = 255;
+				q.push({ nx, ny });
+			}
+		}
+	}
+	return out;
+}
+
+static void maskToRegionPoints(const Mat &mask, shared_ptr<Frame> depthD2C, const Mat &colorBGR, const OBCalibrationParam &param,
+                               vector<OBColorPoint> &outPoints) {
+	int W = mask.cols, H = mask.rows;
+	auto raw = (uint16_t *)depthD2C->data();
+	for(int y = 0; y < H; ++y) {
+		const uchar *m = mask.ptr<uchar>(y);
+		for(int x = 0; x < W; ++x) {
+			if(!m[x]) continue;
+			uint16_t d = raw[y * W + x];
+			if(d == 0) continue;
+			OBPoint3f P{};
+			OBPoint2f s{ (float)x, (float)y };
+			CoordinateTransformHelper::calibration2dTo3d(param, s, (float)d, OB_SENSOR_COLOR, OB_SENSOR_COLOR, &P);
+			OBColorPoint cp{};
+			cp.x = P.x; cp.y = P.y; cp.z = P.z;
+			Vec3b bgr = colorBGR.at<Vec3b>(y, x);
+			cp.b = bgr[0]; cp.g = bgr[1]; cp.r = bgr[2];
+			outPoints.push_back(cp);
+		}
+	}
+}
+
+static void createFullRGBDPointCloud(const OBCalibrationParam &param, uint32_t colorWidth, uint32_t colorHeight,
+                                     shared_ptr<Frame> depthD2C, shared_ptr<Frame> colorFrame,
+                                     vector<OBColorPoint> &outPoints) {
+	uint32_t tableSize = colorWidth * colorHeight * 2;
+	unique_ptr<float[]> tables(new float[tableSize]);
+	OBXYTables          xyTables{};
+	if(!CoordinateTransformHelper::transformationInitXYTables(param, OB_SENSOR_COLOR, tables.get(), &tableSize, &xyTables)) {
+		return;
+	}
+	uint32_t         pointcloudSize = colorWidth * colorHeight * sizeof(OBColorPoint);
+	unique_ptr<uint8_t[]> buffer(new uint8_t[pointcloudSize]);
+	OBColorPoint *   pointPixel = (OBColorPoint *)buffer.get();
+	CoordinateTransformHelper::transformationDepthToRGBDPointCloud(&xyTables, depthD2C->data(), colorFrame->data(), pointPixel);
+	int pointsSize = pointcloudSize / sizeof(OBColorPoint);
+	outPoints.assign(pointPixel, pointPixel + pointsSize);
+}
 
 struct PointCloudData {
     vector<OBColorPoint>      points;
@@ -130,19 +472,13 @@ bool detectArUcoMarkers(const Mat &image, vector<Point2f> &corners, vector<int> 
                 markerCornerMap[marker.first] = marker.second;
 
                 Point2f center(0, 0);
-                for(const auto &corner: marker.second) {
-                    center += corner;
-                }
-                center /= 4.0f;
+                for(const auto &corner: marker.second) center += corner;
+                center *= 0.25f;
                 planeCorners.push_back(center);
             }
 
-            if(markerCornerMap.count(3) && markerCornerMap.count(2) && markerCornerMap.count(0) && markerCornerMap.count(1)) {
-                regionCorners.push_back(markerCornerMap[3][0]);  // TL from marker 3
-                regionCorners.push_back(markerCornerMap[2][1]);  // TR from marker 2
-                regionCorners.push_back(markerCornerMap[0][2]);  // BR from marker 0
-                regionCorners.push_back(markerCornerMap[1][3]);  // BL from marker 1
-            }
+            // 내부 코너 기반 폴리곤 산출 (ID 매핑: 0:TL,1:TR,2:BL,3:BR)
+            regionCorners = computeInnerCorners(markerCornerMap, ids);
 
             if(visualize) {
                 Mat vis = image.clone();
@@ -160,7 +496,7 @@ bool detectArUcoMarkers(const Mat &image, vector<Point2f> &corners, vector<int> 
                 }
 
                 imshow("ArUco Marker Detection", vis);
-                waitKey(1000);
+                waitKey(500);
             }
 
             std::cout << "ArUco 마커 검출 성공! 마커 수: " << markersWithIds.size() << std::endl;
@@ -265,7 +601,9 @@ shared_ptr<ob::FrameSet> getStableFrameset(shared_ptr<ob::Pipeline>& pipeline,
     
     while(retries < maxRetries) {
         try {
-            frameset = pipeline->waitForFrames(timeoutMs);
+            for(int i = 0; i < 20; i++) {
+                frameset = pipeline->waitForFrames(timeoutMs); // auto exposure
+            }
             
             if(frameset) {
                 // 각 프레임 상태 체크
@@ -323,8 +661,9 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
                                   bool saveFiles = true) {
     PointCloudData result;
     
-    auto deviceInfo = device->getDeviceInfo();
-    result.deviceSerial = string(deviceInfo->serialNumber());
+    auto deviceInfo      = device->getDeviceInfo();
+    result.deviceSerial  = string(deviceInfo->serialNumber());
+    string ts            = nowTimestamp();
     
     cout << "\n=== 디바이스 처리 중: " << result.deviceSerial << " ===" << endl;
     
@@ -339,11 +678,11 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
     try {
         // Get all stream profiles of the color camera, including stream resolution, frame rate, and frame format
         auto colorProfiles = pipeline->getStreamProfileList(OB_SENSOR_COLOR);
-        if(colorProfiles) {
-            auto profile = colorProfiles->getProfile(OB_PROFILE_DEFAULT);
-            colorProfile = profile->as<ob::VideoStreamProfile>();
+        colorProfile       = colorProfiles->getVideoStreamProfile(3840, OB_HEIGHT_ANY, OB_FORMAT_RGB, OB_FPS_ANY);
+        if(colorProfile) {
+            std::cout << "colorProfile: " << colorProfile->width() << "x" << colorProfile->height() << std::endl;
+            config->enableStream(colorProfile);
         }
-        config->enableStream(colorProfile);
     }
     catch(ob::Error &e) {
         config->setAlignMode(ALIGN_DISABLE);
@@ -353,31 +692,8 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
     // Get all stream profiles of the depth camera, including stream resolution, frame rate, and frame format
     std::shared_ptr<ob::StreamProfileList> depthProfileList;
     OBAlignMode                            alignMode = ALIGN_DISABLE;
-    if(colorProfile) {
-        // Try find supported depth to color align hardware mode profile
-        depthProfileList = pipeline->getD2CDepthProfileList(colorProfile, ALIGN_D2C_HW_MODE);
-        if(depthProfileList->count() > 0) {
-            alignMode = ALIGN_D2C_HW_MODE;
-        }
-        else {
-            // Try find supported depth to color align software mode profile
-            depthProfileList = pipeline->getD2CDepthProfileList(colorProfile, ALIGN_D2C_SW_MODE);
-            if(depthProfileList->count() > 0) {
-                alignMode = ALIGN_D2C_SW_MODE;
-            }
-        }
-
-        try {
-            // Enable frame synchronization
-            pipeline->enableFrameSync();
-        }
-        catch(ob::Error &e) {
-            std::cerr << "Current device is not support frame sync!" << std::endl;
-        }
-    }
-    else {
-        depthProfileList = pipeline->getStreamProfileList(OB_SENSOR_DEPTH);
-    }
+    
+    depthProfileList = pipeline->getStreamProfileList(OB_SENSOR_DEPTH);
 
 
     if(depthProfileList->count() > 0) {
@@ -420,19 +736,20 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
     
     cout << "초기 프레임 획득 성공!" << endl;
     
-    // 포인트 클라우드 필터 생성
-    auto pointCloudFilter = make_shared<ob::PointCloudFilter>();
-    auto cameraParam = pipeline->getCameraParam();
-    pointCloudFilter->setCameraParam(cameraParam);
+    	// 포인트 클라우드 필터 생성
+	auto pointCloudFilter = make_shared<ob::PointCloudFilter>();
+	auto cameraParam      = pipeline->getCameraParam();
+	pointCloudFilter->setCameraParam(cameraParam);
+	auto calibParam       = pipeline->getCalibrationParam(config);
     
     auto init_depth_frame = init_frameset->depthFrame();
     auto init_color_frame = init_frameset->colorFrame();
     
-    const uint32_t depth_width = init_depth_frame->width();
+    const uint32_t depth_width  = init_depth_frame->width();
     const uint32_t depth_height = init_depth_frame->height();
-    const uint32_t depth_size = depth_width * depth_height;
-    const uint32_t color_width = init_color_frame->width();
-    const uint32_t color_height = init_color_frame->height();
+    const uint32_t depth_size   = depth_width * depth_height;
+    const uint32_t color_width  = colorProfile ? colorProfile->width() : init_color_frame->width();
+    const uint32_t color_height = colorProfile ? colorProfile->height() : init_color_frame->height();
     
     // 프레임 정보 디버그 출력
     cout << "Color frame info: " << color_width << "x" << color_height << endl;
@@ -473,17 +790,12 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
     // ArUco 마커 검출
     cout << "ArUco 마커 검출 중..." << endl;
     result.arucoFound = detectArUcoMarkers(result.colorImage, result.arucoCorners, result.arucoIds, result.planeCorners, result.arucoMarkerCorners,
-                                           result.regionDefiningCorners, true);
+										 result.regionDefiningCorners, true);
 
-    if(result.arucoFound) {
-        cout << "ArUco 마커 검출 성공! 마커 수: " << result.arucoIds.size() << endl;
-        cout << "검출된 마커 ID: ";
-        for(int id : result.arucoIds) {
-            cout << id << " ";
-        }
-        cout << endl;
-    } else {
-        cout << "ArUco 마커를 찾을 수 없습니다." << endl;
+    if(!(result.arucoFound && result.regionDefiningCorners.size() == 4)) {
+        cout << "ArUco 4개가 검출되지 않아 저장을 생략합니다." << endl;
+        pipeline->stop();
+        return result;
     }
     
     // 여러 프레임 수로 평균 계산
@@ -529,129 +841,274 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
         }
     }
     
-    // 각 프레임 수에 대한 평균 depth 계산 및 포인트 클라우드 생성
-    for(int frameNum : meanFrameNums) {
-        cout << frameNum << " 프레임 평균 계산 중..." << endl;
-        
-        // 템플릿 프레임셋 획득 (안정적인 함수 사용)
-        shared_ptr<ob::FrameSet> target_frameset = getStableFrameset(pipeline, 5, 2000);
-        
-        if(!target_frameset) {
-            cout << "템플릿 프레임 획득 실패, 건너뜀..." << endl;
-            continue;
+    // 평균 depth 계산용 프레임셋 획득
+    shared_ptr<ob::FrameSet> target_frameset = getStableFrameset(pipeline, 5, 2000);
+    if(!target_frameset) {
+        cout << "템플릿 프레임 획득 실패, 종료..." << endl;
+        pipeline->stop();
+        return result;
+    }
+
+    // 평균 depth 계산
+    uint16_t* out_depth_data = (uint16_t*)target_frameset->depthFrame()->data();
+    for(uint32_t i = 0; i < depth_size; i++) {
+        // 가장 긴 프레임 수 기준 평균 사용
+        int frameNum = maxFrames;
+        if(depth_counts[frameNum][i] > 0) {
+            double mean     = (double)depth_sums[frameNum][i] / depth_counts[frameNum][i];
+            double variance = (double)depth_sum_sqs[frameNum][i] / depth_counts[frameNum][i] - mean * mean;
+            double std_dev  = sqrt(max(0.0, variance));
+            if(std_dev < (mean * 0.2)) out_depth_data[i] = (uint16_t)round(mean);
+            else out_depth_data[i] = 0;
         }
-        
-        // 평균 depth 계산
-        uint16_t* out_depth_data = (uint16_t*)target_frameset->depthFrame()->data();
-        for(uint32_t i = 0; i < depth_size; i++) {
-            if(depth_counts[frameNum][i] > 0) {
-                double mean = (double)depth_sums[frameNum][i] / depth_counts[frameNum][i];
-                double variance = (double)depth_sum_sqs[frameNum][i] / depth_counts[frameNum][i] - mean * mean;
-                double std_dev = sqrt(max(0.0, variance));
-                
-                // 표준편차가 평균의 20% 이하인 경우만 유효
-                if(std_dev < (mean * 0.2)) {
-                    out_depth_data[i] = (uint16_t)round(mean);
-                } else {
-                    out_depth_data[i] = 0;
-                }
-            }
-            else {
-                out_depth_data[i] = 0;
-            }
-        }
-        
-        // 포인트 클라우드 생성 (depth만 사용)
-        auto depthValueScale = target_frameset->depthFrame()->getValueScale();
-        pointCloudFilter->setPositionDataScaled(depthValueScale);
-        pointCloudFilter->setCreatePointFormat(OB_FORMAT_POINT);  // RGB 없이 포인트만 생성
-        
-        // depth 프레임만으로 포인트 클라우드 생성
-        auto pcFrame = pointCloudFilter->process(target_frameset->depthFrame());
-        if(pcFrame) {
-            OBPoint3f* points3D = (OBPoint3f*)pcFrame->data();
-            int pointCount = pcFrame->dataSize() / sizeof(OBPoint3f);
-            
-            // 포인트를 result에 추가 (중복 제거를 위한 set 사용)
-            set<tuple<float, float, float>> uniquePoints;
-            for(int i = 0; i < pointCount; i++) {
-                if(points3D[i].z > 0) {
-                    auto key = make_tuple(
-                        round(points3D[i].x * 100) / 100,  // 0.01mm 정밀도로 반올림
-                        round(points3D[i].y * 100) / 100,
-                        round(points3D[i].z * 100) / 100
-                    );
-                    
-                    if(uniquePoints.find(key) == uniquePoints.end()) {
-                        uniquePoints.insert(key);
-                        
-                        // OBColorPoint 생성 (컬러 정보 추가)
-                        OBColorPoint colorPoint;
-                        colorPoint.x = points3D[i].x;
-                        colorPoint.y = points3D[i].y;
-                        colorPoint.z = points3D[i].z;
-                        
-                        // 이미지 좌표 계산 (카메라 파라미터 사용)
-                        int img_x = (i % depth_width) * color_width / depth_width;
-                        int img_y = (i / depth_width) * color_height / depth_height;
-                        
-                        if(img_x >= 0 && img_x < color_width && img_y >= 0 && img_y < color_height) {
-                            Vec3b color = result.colorImage.at<Vec3b>(img_y, img_x);
-                            colorPoint.b = color[0];
-                            colorPoint.g = color[1];
-                            colorPoint.r = color[2];
-                        } else {
-                            colorPoint.r = colorPoint.g = colorPoint.b = 255;
-                        }
-                        
-                        result.points.push_back(colorPoint);
-                    }
-                }
-            }
+        else out_depth_data[i] = 0;
+    }
+	
+    // SDK 포인트클라우드 생성 (depth only -> color 매핑)
+    result.points.clear();
+    pointCloudFilter->setCreatePointFormat(OB_FORMAT_POINT);
+    auto pcFrame = pointCloudFilter->process(target_frameset->depthFrame());
+    
+    if(pcFrame) {
+        OBPoint3f *points3D = (OBPoint3f *)pcFrame->data();
+
+        int pointCnt = pcFrame->dataSize() / sizeof(OBPoint3f);
+        for(int i = 0; i < pointCnt; ++i) {
+            const auto &P = points3D[i]; if(P.z <= 0) continue;
+            OBColorPoint cp{}; cp.x = P.x; cp.y = P.y; cp.z = P.z;
+            OBPoint2f uv{};
+            if(CoordinateTransformHelper::calibration3dTo2d(calibParam, { P.x, P.y, P.z }, OB_SENSOR_DEPTH, OB_SENSOR_COLOR, &uv)) {
+                int u = (int)uv.x, v = (int)uv.y;
+                if(u >= 0 && u < (int)color_width && v >= 0 && v < (int)color_height) {
+                    Vec3b bgr = result.colorImage.at<Vec3b>(v, u);
+                    cp.b = bgr[0]; cp.g = bgr[1]; cp.r = bgr[2];
+                } else { cp.r = cp.g = cp.b = 255; }
+            } else { cp.r = cp.g = cp.b = 255; }
+            result.points.push_back(cp);
         }
     }
     
-    // ArUco 영역 내 포인트 필터링
-    if(result.arucoFound && result.regionDefiningCorners.size() == 4) {
-        auto calibParam = pipeline->getCalibrationParam(config);
-        for(const auto &p: result.points) {
-            if(p.z > 0) {
-                OBPoint2f colorPixel = { 0 };
-                CoordinateTransformHelper::calibration3dTo2d(calibParam, { p.x, p.y, p.z }, OB_SENSOR_DEPTH, OB_SENSOR_COLOR, &colorPixel);
 
-                if(colorPixel.x >= 0 && colorPixel.x < color_width && colorPixel.y >= 0 && colorPixel.y < color_height) {
-                    if(pointPolygonTest(result.regionDefiningCorners, Point2f(colorPixel.x, colorPixel.y), false) >= 0) {
-                        result.regionPoints.push_back(p);
-                    }
-                }
+    std::cout << "result.regionDefiningCorners: " << result.regionDefiningCorners.size() << std::endl;
+    // ArUco 영역의 포인트 클라우드 추출
+    // 1. ArUco RGB 좌표를 Depth 좌표로 변환
+    auto depthD2CFrame = buildDepthD2CByCalibration(calibParam, target_frameset->depthFrame(), color_width, color_height);
+    vector<Point2f> depthCorners;
+
+    auto  depthD2CData  = (uint16_t*)depthD2CFrame->data();
+    float valueScaleMM  = 1.0f;
+    if(auto ddf = depthD2CFrame->as<ob::DepthFrame>()) {
+        valueScaleMM = ddf->getValueScale();
+    } else if(auto sdf = target_frameset->depthFrame()->as<ob::DepthFrame>()) {
+        valueScaleMM = sdf->getValueScale();
+    }
+
+    auto inBounds = [&](int x, int y){ return x >= 0 && x < (int)color_width && y >= 0 && y < (int)color_height; };
+
+    for (const auto& corner : result.regionDefiningCorners) {
+        OBPoint2f colorPoint = { corner.x, corner.y };
+        int cx = (int)round(corner.x);
+        int cy = (int)round(corner.y);
+        uint16_t rawDepth = 0;
+        // 주변 7x7 윈도우에서 유효 depth 탐색
+        for(int dy = -3; dy <= 3 && rawDepth == 0; ++dy) {
+            for(int dx = -3; dx <= 3 && rawDepth == 0; ++dx) {
+                int x = cx + dx, y = cy + dy;
+                if(!inBounds(x, y)) continue;
+                rawDepth = depthD2CData[y * color_width + x];
+            }
+        }
+        if(rawDepth == 0) continue;
+        float depthValueMM = rawDepth * valueScaleMM; // mm 단위
+        OBPoint2f depthPoint;
+        if (CoordinateTransformHelper::calibration2dTo2d(calibParam, colorPoint, depthValueMM, OB_SENSOR_COLOR, OB_SENSOR_DEPTH, &depthPoint)) {
+            depthCorners.push_back(Point2f(depthPoint.x, depthPoint.y));
+        }
+    }
+
+    // 깊이 좌표계 폴리곤도 TL,TR,BR,BL 순서로 정렬해 왜곡 방지
+    if(depthCorners.size() == 4) {
+        orderPolygonTLTRBRBL(depthCorners);
+    }
+    
+    // 2. 변환된 좌표를 이용해 마스크 생성 및 포인트 필터링 (마스크된 depth → PCD 생성: 정확 일치)
+    if (depthCorners.size() == 4) {
+        auto depthFrame = target_frameset->depthFrame()->as<ob::DepthFrame>();
+        const uint32_t tgtDepthW = depthFrame->width();
+        const uint32_t tgtDepthH = depthFrame->height();
+        Mat roiMask = polygonMask(Size(tgtDepthW, tgtDepthH), depthCorners);
+
+        // 마스크된 depth 생성
+        const uint16_t *orig = (const uint16_t *)depthFrame->data();
+        vector<uint16_t> masked(tgtDepthW * tgtDepthH, 0);
+        for(uint32_t y = 0; y < tgtDepthH; ++y) {
+            const uchar *m = roiMask.ptr<uchar>(y);
+            for(uint32_t x = 0; x < tgtDepthW; ++x) {
+                if(m[x]) masked[y * tgtDepthW + x] = orig[y * tgtDepthW + x];
+            }
+        }
+        auto maskedDepthFrame = ob::FrameHelper::createFrame(OB_FRAME_DEPTH, depthFrame->format(), tgtDepthW, tgtDepthH, 0);
+        memcpy(maskedDepthFrame->data(), masked.data(), masked.size() * sizeof(uint16_t));
+
+        // 마스크된 포인트클라우드 생성 후 컬러 매핑
+        pointCloudFilter->setCreatePointFormat(OB_FORMAT_POINT);
+        auto regionPcFrame = pointCloudFilter->process(maskedDepthFrame);
+        result.regionPoints.clear();
+        if(regionPcFrame && regionPcFrame->dataSize() > 0) {
+            int n = regionPcFrame->dataSize() / sizeof(OBPoint3f);
+            auto pts = (const OBPoint3f *)regionPcFrame->data();
+            for(int i = 0; i < n; ++i) {
+                const auto &P = pts[i]; if(P.z <= 0) continue;
+                OBColorPoint cp{}; cp.x = P.x; cp.y = P.y; cp.z = P.z;
+                OBPoint2f uv{};
+                if(CoordinateTransformHelper::calibration3dTo2d(calibParam, { P.x, P.y, P.z }, OB_SENSOR_DEPTH, OB_SENSOR_COLOR, &uv)) {
+                    int u = (int)uv.x, v = (int)uv.y;
+                    if(u >= 0 && u < (int)color_width && v >= 0 && v < (int)color_height) {
+                        Vec3b bgr = result.colorImage.at<Vec3b>(v, u);
+                        cp.b = bgr[0]; cp.g = bgr[1]; cp.r = bgr[2];
+                    } else { cp.r = cp.g = cp.b = 255; }
+                } else { cp.r = cp.g = cp.b = 255; }
+                result.regionPoints.push_back(cp);
             }
         }
     }
 
-    cout << "총 포인트 수: " << result.points.size() << endl;
-    if(!result.regionPoints.empty()) {
-        cout << "영역 내 포인트 수: " << result.regionPoints.size() << endl;
-    }
+	cout << "총 포인트 수: " << result.points.size() << endl;
+	cout << "영역 내 포인트 수: " << result.regionPoints.size() << endl;
 
-    // 파일 저장
-    if(saveFiles && !result.points.empty()) {
-        string filename = "MeanPointCloud_" + result.deviceSerial + ".ply";
-        saveRGBPointsToPly(result.points, filename);
-        cout << "포인트 클라우드 저장됨: " << filename << endl;
+	// 파일 저장
+	if(saveFiles && !result.points.empty()) {
+        string prefix     = "capture_" + result.deviceSerial + "_" + ts;
+        string fullPly    = prefix + "_full.ply";
+        string regionPly  = "";
+        saveRGBPointsToPly(result.points, fullPly);
+        cout << "포인트 클라우드 저장됨: " << fullPly << endl;
 
         if(!result.regionPoints.empty()) {
-            string regionFilename = "MeanPointCloud_Region_" + result.deviceSerial + ".ply";
-            saveRGBPointsToPly(result.regionPoints, regionFilename);
-            cout << "영역 포인트 클라우드 저장됨: " << regionFilename << endl;
+            regionPly = prefix + "_plane.ply";
+            saveRGBPointsToPly(result.regionPoints, regionPly);
+            cout << "평면 영역 포인트 클라우드 저장됨: " << regionPly << endl;
         }
 
         // 컬러 이미지 저장
-        string imgFilename = "ColorImage_" + result.deviceSerial + ".png";
+        string imgFilename = prefix + "_color.png";
         imwrite(imgFilename, result.colorImage);
         cout << "컬러 이미지 저장됨: " << imgFilename << endl;
+
+        // ===== 디버그 시각화: ROI 테두리 (RGB, Depth->RGB) =====
+        try {
+            // 1) 컬러 ROI(ArUco 기반) 그리기 - 파란색
+            Mat visColor = result.colorImage.clone();
+            vector<Point> colorPoly;
+            for(const auto &p : result.regionDefiningCorners) colorPoly.emplace_back((int)round(p.x), (int)round(p.y));
+            if(colorPoly.size() == 4) {
+                polylines(visColor, colorPoly, true, Scalar(255, 0, 0), 2, LINE_AA);
+            }
+
+            // 2) Depth ROI를 Color 좌표계로 투영하여 겹쳐 그리기 - 빨간색
+            vector<Point> depthAsColorPoly;
+            if(depthCorners.size() == 4) {
+                auto dframe = target_frameset->depthFrame()->as<ob::DepthFrame>();
+                const uint16_t *origDepth = (const uint16_t *)dframe->data();
+                float vscale = dframe->getValueScale();
+                uint32_t dw = dframe->width();
+                uint32_t dh = dframe->height();
+                auto insideD = [&](int x, int y){ return x >= 0 && x < (int)dw && y >= 0 && y < (int)dh; };
+                for(const auto &dp : depthCorners) {
+                    int cx = (int)round(dp.x), cy = (int)round(dp.y);
+                    uint16_t rawD = 0;
+                    for(int dy = -3; dy <= 3 && rawD == 0; ++dy) {
+                        for(int dx = -3; dx <= 3 && rawD == 0; ++dx) {
+                            int x = cx + dx, y = cy + dy;
+                            if(!insideD(x, y)) continue;
+                            rawD = origDepth[y * dw + x];
+                        }
+                    }
+                    if(rawD == 0) continue;
+                    float dmm = rawD * vscale;
+                    OBPoint2f sp{ (float)cx, (float)cy }, tp{};
+                    if(CoordinateTransformHelper::calibration2dTo2d(calibParam, sp, dmm, OB_SENSOR_DEPTH, OB_SENSOR_COLOR, &tp)) {
+                        depthAsColorPoly.emplace_back((int)round(tp.x), (int)round(tp.y));
+                    }
+                }
+                if(depthAsColorPoly.size() == 4) {
+                    polylines(visColor, depthAsColorPoly, true, Scalar(0, 0, 255), 2, LINE_AA);
+                }
+            }
+            string roiColorDbg = prefix + "_color_roi_debug.png";
+            imwrite(roiColorDbg, visColor);
+
+            // 3) Depth ROI 마스크 시각화 저장
+            if(depthCorners.size() == 4) {
+                uint32_t dw = target_frameset->depthFrame()->width();
+                uint32_t dh = target_frameset->depthFrame()->height();
+                Mat roiMask = polygonMask(Size(dw, dh), depthCorners);
+                Mat depthMaskVis;
+                cvtColor(roiMask, depthMaskVis, COLOR_GRAY2BGR);
+                polylines(depthMaskVis, vector<vector<Point>>{ { Point((int)round(depthCorners[0].x),(int)round(depthCorners[0].y)),
+                                                                 Point((int)round(depthCorners[1].x),(int)round(depthCorners[1].y)),
+                                                                 Point((int)round(depthCorners[2].x),(int)round(depthCorners[2].y)),
+                                                                 Point((int)round(depthCorners[3].x),(int)round(depthCorners[3].y)) } },
+                         true, Scalar(0,255,0), 1, LINE_AA);
+                string roiDepthDbg = prefix + "_depth_roi_debug.png";
+                imwrite(roiDepthDbg, depthMaskVis);
+            }
+
+            // 4) D2C depth 시각화 (폴백 결과 포함)
+            if(depthD2CFrame && depthD2CFrame->dataSize() > 0) {
+                auto ddf = depthD2CFrame->as<ob::DepthFrame>();
+                uint32_t cw = color_width, ch = color_height;
+                Mat d16(ch, cw, CV_16UC1, (void *)depthD2CFrame->data());
+                double minv, maxv; minMaxLoc(d16, &minv, &maxv);
+                Mat d8; d16.convertTo(d8, CV_8U, 255.0 / (maxv > 0 ? maxv : 1000.0));
+                Mat d8c; applyColorMap(d8, d8c, COLORMAP_JET);
+                // ROI(컬러 기준 파란색), depth->color ROI(빨강) 함께 겹치기
+                if(colorPoly.size() == 4) polylines(d8c, colorPoly, true, Scalar(255,0,0), 2, LINE_AA);
+                if(depthAsColorPoly.size() == 4) polylines(d8c, depthAsColorPoly, true, Scalar(0,0,255), 2, LINE_AA);
+                string d2cDbg = prefix + string("_d2c_debug.png");
+                imwrite(d2cDbg, d8c);
+            }
+        } catch(...) {
+            // 시각화 실패는 무시
+        }
+
+        // JSON 메타데이터 저장
+        if(result.arucoFound) {
+            auto centerPoints = getArUcoCenterPoints(result.points, result.planeCorners, result.colorImage.cols, result.colorImage.rows);
+            if(centerPoints.size() == EXPECTED_MARKERS) {
+                cJSON *root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "deviceSerial", result.deviceSerial.c_str());
+                cJSON_AddStringToObject(root, "timestamp", ts.c_str());
+                cJSON_AddBoolToObject(root, "arucoFound", result.arucoFound);
+                cJSON_AddStringToObject(root, "fullPly", fullPly.c_str());
+                if(!regionPly.empty()) cJSON_AddStringToObject(root, "regionPly", regionPly.c_str());
+                cJSON_AddStringToObject(root, "colorImage", imgFilename.c_str());
+
+                cJSON *pointsArray = cJSON_CreateArray();
+                for(const auto &p: centerPoints) {
+                    cJSON *point = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(point, "x", p.x());
+                    cJSON_AddNumberToObject(point, "y", p.y());
+                    cJSON_AddNumberToObject(point, "z", p.z());
+                    cJSON_AddItemToArray(pointsArray, point);
+                }
+                cJSON_AddItemToObject(root, "arucoCenterPoints3D", pointsArray);
+
+                char *jsonString   = cJSON_Print(root);
+                string jsonFilename = prefix + ".json";
+                ofstream jsonFile(jsonFilename);
+                jsonFile << jsonString;
+                jsonFile.close();
+
+                cout << "메타데이터 저장됨: " << jsonFilename << endl;
+
+                free(jsonString);
+                cJSON_Delete(root);
+            }
+        }
+        pipeline->stop();
     }
     
-    pipeline->stop();
     return result;
 }
 
@@ -715,92 +1172,185 @@ int main(int argc, char **argv) try {
             cout << "\n모든 디바이스 처리 완료!" << endl;
         }
         else if(input == "c") {
-            // 변환 행렬 계산
-            if(processedDevices.size() < 2) {
-                cout << "최소 2개의 디바이스 데이터가 필요합니다!" << endl;
-                continue;
+            // 변환 행렬 계산 (파일 기반)
+            struct CalibEntry { string serial; string timestamp; vector<Vector3d> centers; string regionPly; };
+            vector<CalibEntry> entries;
+
+            // 1. 현재 폴더에서 "capture_*.json" 파일 스캔
+            DIR *          dir;
+            struct dirent *ent;
+            if((dir = opendir(".")) != NULL) {
+                while((ent = readdir(dir)) != NULL) {
+                    string filename = ent->d_name;
+                    if(filename.rfind("capture_", 0) == 0 && filename.size() > 8 && filename.find(".json") != string::npos) {
+                        ifstream jsonFile(filename);
+                        if(!jsonFile.is_open()) continue;
+                        string jsonString((istreambuf_iterator<char>(jsonFile)), istreambuf_iterator<char>());
+                        jsonFile.close();
+
+                        cJSON *root = cJSON_Parse(jsonString.c_str());
+                        if(!root) continue;
+                        cJSON *serial = cJSON_GetObjectItem(root, "deviceSerial");
+                        cJSON *ts     = cJSON_GetObjectItem(root, "timestamp");
+                        cJSON *found  = cJSON_GetObjectItem(root, "arucoFound");
+                        cJSON *pts    = cJSON_GetObjectItem(root, "arucoCenterPoints3D");
+                        cJSON *rply   = cJSON_GetObjectItem(root, "regionPly");
+                        if(cJSON_IsString(serial) && cJSON_IsString(ts) && cJSON_IsBool(found) && found->valueint && cJSON_IsArray(pts) && cJSON_GetArraySize(pts) == 4) {
+                            CalibEntry ce; ce.serial = serial->valuestring; ce.timestamp = ts->valuestring; if(cJSON_IsString(rply)) ce.regionPly = rply->valuestring;
+                            for(int i = 0; i < 4; ++i) {
+                                cJSON *p = cJSON_GetArrayItem(pts, i);
+                                double x = cJSON_GetObjectItem(p, "x")->valuedouble;
+                                double y = cJSON_GetObjectItem(p, "y")->valuedouble;
+                                double z = cJSON_GetObjectItem(p, "z")->valuedouble;
+                                ce.centers.push_back({ x, y, z });
+                            }
+                            entries.push_back(ce);
+                        }
+                        cJSON_Delete(root);
+                    }
+                }
+                closedir(dir);
             }
-            
-            // ArUco 마커가 검출된 디바이스만 필터링
-            vector<PointCloudData> validDevices;
-            for(const auto& data : processedDevices) {
-                if(data.arucoFound) {
-                    validDevices.push_back(data);
+            else { cerr << "현재 디렉토리를 열 수 없습니다!" << endl; continue; }
+
+            if(entries.size() < 2) { cout << "유효한 캡처 파일이 2개 이상 필요합니다." << endl; continue; }
+
+            // 정렬: serial, timestamp
+            sort(entries.begin(), entries.end(), [](const CalibEntry &a, const CalibEntry &b) {
+                if(a.serial == b.serial) return a.timestamp < b.timestamp;
+                return a.serial < b.serial;
+            });
+
+            cout << "\n=== 변환 대상 선택 ===" << endl;
+            for(size_t i = 0; i < entries.size(); ++i) {
+                cout << "  [" << i << "] " << entries[i].serial << "  " << entries[i].timestamp; if(!entries[i].regionPly.empty()) cout << "  (plane ply)"; cout << endl;
+            }
+
+            int refIndex = -1, targetIndex = -1;
+            cout << "\n기준(Base) 인덱스: "; cin >> refIndex;
+            cout << "대상(Target) 인덱스: "; cin >> targetIndex;
+            if(refIndex < 0 || refIndex >= (int)entries.size() || targetIndex < 0 || targetIndex >= (int)entries.size() || refIndex == targetIndex) {
+                cout << "잘못된 선택입니다." << endl; continue;
+            }
+
+            const auto &ref    = entries[refIndex];
+            const auto &target = entries[targetIndex];
+
+            // SVD 초기 정합
+            Matrix4d T = computeTransformationSVD(target.centers, ref.centers);
+
+            // 선택적 ICP (평면 ply가 양쪽 모두 있을 때)
+            auto loadPly = [](const string &path) {
+                vector<Vector3d> pts; pts.reserve(10000);
+                ifstream f(path); if(!f.is_open()) return pts;
+                string line; bool header = true; int vertexCount = 0; while(getline(f, line)) {
+                    if(header) {
+                        if(line.rfind("element vertex", 0) == 0) {
+                            sscanf(line.c_str(), "element vertex %d", &vertexCount);
+                        }
+                        if(line == "end_header") header = false;
+                        continue;
+                    }
+                    if(vertexCount <= 0) break;
+                    double x, y, z; int r, g, b; std::istringstream iss(line);
+                    if(!(iss >> x >> y >> z)) continue;
+                    pts.emplace_back(x, y, z);
+                    if((int)pts.size() >= 20000) break; // limit
+                }
+                return pts;
+            };
+
+            auto downsample = [](vector<Vector3d> &pts, size_t maxN) {
+                if(pts.size() <= maxN) return;
+                std::mt19937 rng((uint32_t)time(nullptr));
+                std::shuffle(pts.begin(), pts.end(), rng);
+                pts.resize(maxN);
+            };
+
+            auto refineICP = [&](const vector<Vector3d> &src0, const vector<Vector3d> &dst0, Matrix4d &Tinout) {
+                vector<Vector3d> src = src0, dst = dst0;
+                downsample(src, 8000); downsample(dst, 8000);
+                double maxDist2 = 30.0 * 30.0;
+                for(int iter = 0; iter < 20; ++iter) {
+                    vector<Vector3d> s, d;
+                    // transform src by Tinout
+                    for(const auto &p: src) {
+                        Vector4d q(p.x(), p.y(), p.z(), 1.0);
+                        q = Tinout * q; s.emplace_back(q.x(), q.y(), q.z());
+                    }
+                    // brute-force nearest neighbor
+                    int used = 0;
+                    for(const auto &ps: s) {
+                        double best = 1e18; int bi = -1; for(size_t j = 0; j < dst.size(); ++j) {
+                            double dd = (ps - dst[j]).squaredNorm(); if(dd < best) { best = dd; bi = (int)j; }
+                        }
+                        if(best < maxDist2 && bi >= 0) { d.push_back(dst[bi]); used++; }
+                    }
+                    if(d.size() < 50) break;
+                    // compute SVD between s' and d
+                    Vector3d cs = Vector3d::Zero(), cd = Vector3d::Zero();
+                    for(size_t i = 0, k = 0; i < s.size(); ++i) {
+                        Vector3d ps = s[i];
+                        // paired only if within threshold
+                        double best = 1e18; int bi = -1; for(size_t j = 0; j < dst.size(); ++j) {
+                            double dd = (ps - dst[j]).squaredNorm(); if(dd < best) { best = dd; bi = (int)j; }
+                        }
+                        if(best >= maxDist2 || bi < 0) continue;
+                        cs += ps; cd += dst[bi];
+                    }
+                    int N = 0;
+                    for(const auto &ps: s) {
+                        double best = 1e18; int bi = -1; for(size_t j = 0; j < dst.size(); ++j) {
+                            double dd = (ps - dst[j]).squaredNorm(); if(dd < best) { best = dd; bi = (int)j; }
+                        }
+                        if(best < maxDist2) N++;
+                    }
+                    if(N < 50) break;
+                    cs /= N; cd /= N;
+                    MatrixXd H(3, 3); H.setZero();
+                    for(const auto &ps: s) {
+                        double best = 1e18; int bi = -1; for(size_t j = 0; j < dst.size(); ++j) {
+                            double dd = (ps - dst[j]).squaredNorm(); if(dd < best) { best = dd; bi = (int)j; }
+                        }
+                        if(best >= maxDist2 || bi < 0) continue;
+                        H += (ps - cs) * (dst[bi] - cd).transpose();
+                    }
+                    JacobiSVD<Matrix3d> svd(H, ComputeFullU | ComputeFullV);
+                    Matrix3d R = svd.matrixV() * svd.matrixU().transpose();
+                    if(R.determinant() < 0) { Matrix3d V = svd.matrixV(); V.col(2) *= -1; R = V * svd.matrixU().transpose(); }
+                    Vector3d t = cd - R * cs;
+                    Matrix4d dT = Matrix4d::Identity(); dT.block<3, 3>(0, 0) = R; dT.block<3, 1>(0, 3) = t;
+                    Tinout = dT * Tinout;
+                }
+            };
+
+            if(!ref.regionPly.empty() && !target.regionPly.empty()) {
+                vector<Vector3d> pref = loadPly(ref.regionPly);
+                vector<Vector3d> ptgt = loadPly(target.regionPly);
+                if(!pref.empty() && !ptgt.empty()) {
+                    refineICP(ptgt, pref, T);
                 }
             }
-            
-            if(validDevices.size() < 2) {
-                cout << "ArUco 마커가 검출된 디바이스가 2개 이상 필요합니다!" << endl;
-                continue;
-            }
-            
-            cout << "\n=== 변환 행렬 계산 ===" << endl;
-            
-            // 첫 번째 디바이스를 기준으로 설정
-            const auto& referenceDevice = validDevices[0];
-            cout << "기준 디바이스: " << referenceDevice.deviceSerial << endl;
-            
-            // 기준 디바이스의 ArUco 마커 영역 3D 포인트 추출
-            auto refPoints3D = getArUcoCenterPoints(
-                referenceDevice.points,
-                referenceDevice.planeCorners,
-                referenceDevice.colorImage.cols,
-                referenceDevice.colorImage.rows
-            );
-            
-            // 다른 디바이스들과의 변환 행렬 계산
-            for(size_t i = 1; i < validDevices.size(); i++) {
-                const auto& targetDevice = validDevices[i];
-                cout << "\n대상 디바이스: " << targetDevice.deviceSerial << endl;
-                
-                // 대상 디바이스의 ArUco 마커 영역 3D 포인트 추출
-                auto targetPoints3D = getArUcoCenterPoints(
-                    targetDevice.points,
-                    targetDevice.planeCorners,
-                    targetDevice.colorImage.cols,
-                    targetDevice.colorImage.rows
-                );
-                
-                if(refPoints3D.size() != EXPECTED_MARKERS) {
-                    cout << "경고: 기준 디바이스의 마커 3D 포인트를 모두 추출하지 못했습니다! (필요: " << EXPECTED_MARKERS << ", 실제: " << refPoints3D.size() << "개)" << endl;
-                    continue;
-                }
-                
-                if(targetPoints3D.size() != EXPECTED_MARKERS) {
-                    cout << "경고: 대상 디바이스의 마커 3D 포인트를 모두 추출하지 못했습니다! (필요: " << EXPECTED_MARKERS << ", 실제: " << targetPoints3D.size() << "개)" << endl;
-                    continue;
-                }
-                
-                // SVD를 사용하여 변환 행렬 계산
-                Matrix4d T = computeTransformationSVD(targetPoints3D, refPoints3D);
-                
-                // 결과 출력
-                cout << "\n변환 행렬 (Target -> Reference):" << endl;
-                cout << T << endl;
-                
-                // RMSE 계산
-                double rmse = 0;
-                for(size_t j = 0; j < targetPoints3D.size(); j++) {
-                    Vector4d p(targetPoints3D[j](0), targetPoints3D[j](1), targetPoints3D[j](2), 1);
-                    Vector4d transformed = T * p;
-                    Vector3d diff = transformed.head<3>() - refPoints3D[j];
-                    rmse += diff.squaredNorm();
-                }
-                rmse = sqrt(rmse / targetPoints3D.size());
-                cout << "RMSE: " << rmse << " mm" << endl;
-                
-                // 변환 행렬을 파일로 저장
-                string filename = "Transform_" + targetDevice.deviceSerial + "_to_" + 
-                                 referenceDevice.deviceSerial + ".txt";
-                ofstream file(filename);
-                if(file.is_open()) {
-                    file << "# Transformation Matrix from " << targetDevice.deviceSerial 
-                         << " to " << referenceDevice.deviceSerial << endl;
-                    file << "# RMSE: " << rmse << " mm" << endl;
-                    file << T << endl;
-                    file.close();
-                    cout << "변환 행렬 저장됨: " << filename << endl;
-                }
+
+            // 결과 출력 및 저장
+            cout << "\n변환 행렬 (Target -> Reference):" << endl;
+            cout << T << endl;
+
+            // RMSE 계산 (중심점 기반)
+            double rmse = 0; for(size_t j = 0; j < target.centers.size(); j++) {
+                Vector4d p(target.centers[j](0), target.centers[j](1), target.centers[j](2), 1);
+                Vector4d q = T * p; Vector3d diff = q.head<3>() - ref.centers[j]; rmse += diff.squaredNorm();
+            } rmse = sqrt(rmse / target.centers.size());
+            cout << "RMSE: " << rmse << " mm" << endl;
+
+            string filename = "Transform_" + target.serial + "_to_" + ref.serial + "_" + nowTimestamp() + ".txt";
+            ofstream file(filename);
+            if(file.is_open()) {
+                file << "# Transformation Matrix from " << target.serial << " to " << ref.serial << "\n";
+                file << "# RMSE: " << rmse << " mm\n";
+                file << T << "\n";
+                file.close();
+                cout << "변환 행렬 저장됨: " << filename << endl;
             }
         }
         else {

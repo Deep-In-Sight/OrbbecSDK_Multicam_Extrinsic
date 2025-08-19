@@ -63,6 +63,17 @@ endif()
 # 실행 파일 생성
 add_executable(${PROJECT_NAME} Mean_pcd.cpp)
 
+target_sources(Mean_pcd
+                PRIVATE
+                Mean_pcd.cpp
+                ../Sample-MultiDeviceSync/cJSON.c
+)
+
+target_include_directories(Mean_pcd
+                PRIVATE
+                ../Sample-MultiDeviceSync/
+)
+
 # 라이브러리 링크
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_package(Threads REQUIRED)
