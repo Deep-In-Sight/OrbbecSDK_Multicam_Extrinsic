@@ -924,9 +924,53 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
             result.points.push_back(cp);
         }
     }
-    
+
+    // 1) RGB 내부 영역 마스크 생성 (regionDefiningCorners: TL,TR,BR,BL)
+    Mat roiMaskColor = Mat::zeros(result.colorImage.size(), CV_8U);
+    if(result.regionDefiningCorners.size() == 4) {
+        vector<Point> poly;
+        for(const auto &p : result.regionDefiningCorners) poly.emplace_back((int)round(p.x), (int)round(p.y));
+        const Point *pp = poly.data(); int np = (int)poly.size();
+        fillPoly(roiMaskColor, &pp, &np, 1, Scalar(255));
+    }
+
+    // 2) 전체 포인트클라우드 순회 → 3D를 Color로 투영 → ROI 내부만 plane 영역으로 수집
+    result.regionPoints.clear();
+    vector<Vector3d> centerPoints3D; // 후에 JSON 저장 및 SVD 초기값에 사용
+    if(pcFrame && pcFrame->dataSize() > 0 && result.regionDefiningCorners.size() == 4) {
+        // 마커 중심 근처의 최근접 3D 포인트 추정용
+        vector<Vector3d> bestCenter3D(result.planeCorners.size(), Vector3d(0,0,0));
+        vector<double>  bestCenterD2(result.planeCorners.size(), 1e18);
+
+        int n = pcFrame->dataSize() / sizeof(OBPoint3f);
+        const OBPoint3f *pts = (const OBPoint3f *)pcFrame->data();
+        for(int i = 0; i < n; ++i) {
+            const auto &P = pts[i]; if(P.z <= 0) continue;
+            OBPoint2f uv{};
+            if(!CoordinateTransformHelper::calibration3dTo2d(calibParam, { P.x, P.y, P.z }, OB_SENSOR_DEPTH, OB_SENSOR_COLOR, &uv)) continue;
+            int u = (int)round(uv.x), v = (int)round(uv.y);
+            if(u < 0 || u >= (int)color_width || v < 0 || v >= (int)color_height) continue;
+            if(roiMaskColor.data && roiMaskColor.at<uchar>(v, u)) {
+                OBColorPoint cp{}; cp.x = P.x; cp.y = P.y; cp.z = P.z;
+                Vec3b bgr = result.colorImage.at<Vec3b>(v, u);
+                cp.b = bgr[0]; cp.g = bgr[1]; cp.r = bgr[2];
+                result.regionPoints.push_back(cp);
+            }
+            // 각 마커 중심 픽셀에 가장 가까운 투영 포인트를 3D로 기록
+            for(size_t k = 0; k < result.planeCorners.size(); ++k) {
+                double dx = uv.x - result.planeCorners[k].x;
+                double dy = uv.y - result.planeCorners[k].y;
+                double d2 = dx*dx + dy*dy;
+                if(d2 < bestCenterD2[k]) { bestCenterD2[k] = d2; bestCenter3D[k] = Vector3d(P.x, P.y, P.z); }
+            }
+        }
+        for(size_t k = 0; k < bestCenter3D.size(); ++k) {
+            if(bestCenterD2[k] < 1e18) centerPoints3D.push_back(bestCenter3D[k]);
+        }
+    }
 
     std::cout << "result.regionDefiningCorners: " << result.regionDefiningCorners.size() << std::endl;
+    /*
     // ArUco 영역의 포인트 클라우드 추출
     // 1. ArUco RGB 좌표를 Depth 좌표로 변환
     auto depthD2CFrame = buildDepthD2CByCalibration(calibParam, target_frameset->depthFrame(), color_width, color_height);
@@ -1009,6 +1053,7 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
             }
         }
     }
+        */
 
 	cout << "총 포인트 수: " << result.points.size() << endl;
 	cout << "영역 내 포인트 수: " << result.regionPoints.size() << endl;
@@ -1032,89 +1077,39 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
         imwrite(imgFilename, result.colorImage);
         cout << "컬러 이미지 저장됨: " << imgFilename << endl;
 
-        // ===== 디버그 시각화: ROI 테두리 (RGB, Depth->RGB) =====
+        // ===== 디버그 시각화: 컬러 ROI 테두리만 저장 =====
         try {
-            // 1) 컬러 ROI(ArUco 기반) 그리기 - 파란색
             Mat visColor = result.colorImage.clone();
             vector<Point> colorPoly;
             for(const auto &p : result.regionDefiningCorners) colorPoly.emplace_back((int)round(p.x), (int)round(p.y));
             if(colorPoly.size() == 4) {
                 polylines(visColor, colorPoly, true, Scalar(255, 0, 0), 2, LINE_AA);
             }
-
-            // 2) Depth ROI를 Color 좌표계로 투영하여 겹쳐 그리기 - 빨간색
-            vector<Point> depthAsColorPoly;
-            if(depthCorners.size() == 4) {
-                auto dframe = target_frameset->depthFrame()->as<ob::DepthFrame>();
-                const uint16_t *origDepth = (const uint16_t *)dframe->data();
-                float vscale = dframe->getValueScale();
-                uint32_t dw = dframe->width();
-                uint32_t dh = dframe->height();
-                auto insideD = [&](int x, int y){ return x >= 0 && x < (int)dw && y >= 0 && y < (int)dh; };
-                for(const auto &dp : depthCorners) {
-                    int cx = (int)round(dp.x), cy = (int)round(dp.y);
-                    uint16_t rawD = 0;
-                    for(int dy = -3; dy <= 3 && rawD == 0; ++dy) {
-                        for(int dx = -3; dx <= 3 && rawD == 0; ++dx) {
-                            int x = cx + dx, y = cy + dy;
-                            if(!insideD(x, y)) continue;
-                            rawD = origDepth[y * dw + x];
-                        }
-                    }
-                    if(rawD == 0) continue;
-                    float dmm = rawD * vscale;
-                    OBPoint2f sp{ (float)cx, (float)cy }, tp{};
-                    if(CoordinateTransformHelper::calibration2dTo2d(calibParam, sp, dmm, OB_SENSOR_DEPTH, OB_SENSOR_COLOR, &tp)) {
-                        depthAsColorPoly.emplace_back((int)round(tp.x), (int)round(tp.y));
-                    }
-                }
-                if(depthAsColorPoly.size() == 4) {
-                    polylines(visColor, depthAsColorPoly, true, Scalar(0, 0, 255), 2, LINE_AA);
-                }
-            }
             string roiColorDbg = prefix + "_color_roi_debug.png";
             imwrite(roiColorDbg, visColor);
+        } catch(...) { }
 
-            // 3) Depth ROI 마스크 시각화 저장
-            if(depthCorners.size() == 4) {
-                uint32_t dw = target_frameset->depthFrame()->width();
-                uint32_t dh = target_frameset->depthFrame()->height();
-                Mat roiMask = polygonMask(Size(dw, dh), depthCorners);
-                Mat depthMaskVis;
-                cvtColor(roiMask, depthMaskVis, COLOR_GRAY2BGR);
-                polylines(depthMaskVis, vector<vector<Point>>{ { Point((int)round(depthCorners[0].x),(int)round(depthCorners[0].y)),
-                                                                 Point((int)round(depthCorners[1].x),(int)round(depthCorners[1].y)),
-                                                                 Point((int)round(depthCorners[2].x),(int)round(depthCorners[2].y)),
-                                                                 Point((int)round(depthCorners[3].x),(int)round(depthCorners[3].y)) } },
-                         true, Scalar(0,255,0), 1, LINE_AA);
-                string roiDepthDbg = prefix + "_depth_roi_debug.png";
-                imwrite(roiDepthDbg, depthMaskVis);
-            }
-
-            // 4) D2C depth 시각화 (폴백 결과 포함)
-            if(depthD2CFrame && depthD2CFrame->dataSize() > 0) {
-                auto ddf = depthD2CFrame->as<ob::DepthFrame>();
-                uint32_t cw = color_width, ch = color_height;
-                Mat d16(ch, cw, CV_16UC1, (void *)depthD2CFrame->data());
-                double minv, maxv; minMaxLoc(d16, &minv, &maxv);
-                Mat d8; d16.convertTo(d8, CV_8U, 255.0 / (maxv > 0 ? maxv : 1000.0));
-                Mat d8c; applyColorMap(d8, d8c, COLORMAP_JET);
-                // ROI(컬러 기준 파란색), depth->color ROI(빨강) 함께 겹치기
-                if(colorPoly.size() == 4) polylines(d8c, colorPoly, true, Scalar(255,0,0), 2, LINE_AA);
-                if(depthAsColorPoly.size() == 4) polylines(d8c, depthAsColorPoly, true, Scalar(0,0,255), 2, LINE_AA);
-                string d2cDbg = prefix + string("_d2c_debug.png");
-                imwrite(d2cDbg, d8c);
-            }
-        } catch(...) {
-            // 시각화 실패는 무시
-        }
-
-        // JSON 메타데이터 저장: 캘리브레이션에 필요한 최소 필드만 저장
+        // JSON 메타데이터 저장: SVD 초기값(마커 중심 3D) + 전체/평면 PLY 경로 저장
         {
             cJSON *root = cJSON_CreateObject();
             cJSON_AddStringToObject(root, "deviceSerial", result.deviceSerial.c_str());
             cJSON_AddStringToObject(root, "timestamp", ts.c_str());
+            cJSON_AddBoolToObject(root, "arucoFound", result.arucoFound);
+            cJSON_AddStringToObject(root, "fullPly", fullPly.c_str());
             if(!regionPly.empty()) cJSON_AddStringToObject(root, "regionPly", regionPly.c_str());
+            cJSON_AddStringToObject(root, "colorImage", imgFilename.c_str());
+
+            if(!centerPoints3D.empty()) {
+                cJSON *pointsArray = cJSON_CreateArray();
+                for(const auto &p: centerPoints3D) {
+                    cJSON *point = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(point, "x", p.x());
+                    cJSON_AddNumberToObject(point, "y", p.y());
+                    cJSON_AddNumberToObject(point, "z", p.z());
+                    cJSON_AddItemToArray(pointsArray, point);
+                }
+                cJSON_AddItemToObject(root, "arucoCenterPoints3D", pointsArray);
+            }
 
             char *jsonString   = cJSON_Print(root);
             string jsonFilename = prefix + ".json";
@@ -1194,7 +1189,7 @@ int main(int argc, char **argv) try {
         }
         else if(input == "c") {
             // 변환 행렬 계산 (파일 기반)
-            struct CalibEntry { string serial; string timestamp; string regionPly; };
+            struct CalibEntry { string serial; string timestamp; vector<Vector3d> centers; string regionPly; string fullPly; };
             vector<CalibEntry> entries;
 
             // 1. 현재 폴더에서 "capture_*.json" 파일 스캔
@@ -1213,9 +1208,19 @@ int main(int argc, char **argv) try {
                         if(!root) continue;
                         cJSON *serial = cJSON_GetObjectItem(root, "deviceSerial");
                         cJSON *ts     = cJSON_GetObjectItem(root, "timestamp");
+                        cJSON *found  = cJSON_GetObjectItem(root, "arucoFound");
+                        cJSON *pts    = cJSON_GetObjectItem(root, "arucoCenterPoints3D");
                         cJSON *rply   = cJSON_GetObjectItem(root, "regionPly");
-                        if(cJSON_IsString(serial) && cJSON_IsString(ts) && cJSON_IsString(rply)) {
-                            CalibEntry ce; ce.serial = serial->valuestring; ce.timestamp = ts->valuestring; ce.regionPly = rply->valuestring; entries.push_back(ce);
+                        cJSON *fply   = cJSON_GetObjectItem(root, "fullPly");
+                        if(cJSON_IsString(serial) && cJSON_IsString(ts) && cJSON_IsBool(found) && found->valueint && cJSON_IsArray(pts) && cJSON_GetArraySize(pts) >= 3) {
+                            CalibEntry ce; ce.serial = serial->valuestring; ce.timestamp = ts->valuestring; if(cJSON_IsString(rply)) ce.regionPly = rply->valuestring; if(cJSON_IsString(fply)) ce.fullPly = fply->valuestring;
+                            int n = cJSON_GetArraySize(pts);
+                            for(int i = 0; i < n; ++i) {
+                                cJSON *p = cJSON_GetArrayItem(pts, i);
+                                cJSON *xx = cJSON_GetObjectItem(p, "x"); cJSON *yy = cJSON_GetObjectItem(p, "y"); cJSON *zz = cJSON_GetObjectItem(p, "z");
+                                if(cJSON_IsNumber(xx) && cJSON_IsNumber(yy) && cJSON_IsNumber(zz)) ce.centers.push_back(Vector3d(xx->valuedouble, yy->valuedouble, zz->valuedouble));
+                            }
+                            entries.push_back(ce);
                         }
                         cJSON_Delete(root);
                     }
@@ -1234,7 +1239,10 @@ int main(int argc, char **argv) try {
 
             cout << "\n=== 변환 대상 선택 ===" << endl;
             for(size_t i = 0; i < entries.size(); ++i) {
-                cout << "  [" << i << "] " << entries[i].serial << "  " << entries[i].timestamp; if(!entries[i].regionPly.empty()) cout << "  (plane ply)"; cout << endl;
+                cout << "  [" << i << "] " << entries[i].serial << "  " << entries[i].timestamp;
+                if(!entries[i].fullPly.empty()) cout << "  (full ply)";
+                if(!entries[i].regionPly.empty()) cout << "  (plane ply)";
+                cout << endl;
             }
 
             int refIndex = -1, targetIndex = -1;
@@ -1247,8 +1255,8 @@ int main(int argc, char **argv) try {
             const auto &ref    = entries[refIndex];
             const auto &target = entries[targetIndex];
 
-            // 평면 PLY 로드 확인
-            if(ref.regionPly.empty() || target.regionPly.empty()) { cout << "선택된 항목에 평면 PLY 경로가 없습니다." << endl; continue; }
+            // 전체 PLY 로드 확인
+            if(ref.fullPly.empty() || target.fullPly.empty()) { cout << "선택된 항목에 전체 PLY 경로가 없습니다." << endl; continue; }
             auto loadPly = [](const string &path) {
                 vector<Vector3d> pts; pts.reserve(10000);
                 ifstream f(path); if(!f.is_open()) return pts;
@@ -1268,15 +1276,30 @@ int main(int argc, char **argv) try {
                 }
                 return pts;
             };
+            vector<Vector3d> pref = loadPly(ref.fullPly);
+            vector<Vector3d> ptgt = loadPly(target.fullPly);
+            if(pref.size() < 50 || ptgt.size() < 50) { cout << "전체 포인트가 부족합니다." << endl; continue; }
 
-            vector<Vector3d> pref = loadPly(ref.regionPly);
-            vector<Vector3d> ptgt = loadPly(target.regionPly);
-            if(pref.size() < 50 || ptgt.size() < 50) { cout << "평면 포인트가 부족합니다." << endl; continue; }
-
-            // 평면 기반 SVD 초기 정합
+            // SVD 초기 정합 (이전 방식 유지: 마커 중심 3D 기반). 필요 시 평면 PLY 기반 폴백
             Matrix4d T = Matrix4d::Identity();
-            if(!computeInitFromPlanePointClouds(ptgt, pref, T)) {
-                cout << "평면 기반 초기 정합 실패" << endl; continue;
+            bool initOk = false;
+            if(ref.centers.size() >= 3 && target.centers.size() >= 3 && ref.centers.size() == target.centers.size()) {
+                try {
+                    T = computeTransformationSVD(target.centers, ref.centers);
+                    initOk = true;
+                } catch(...) { initOk = false; }
+            }
+            if(!initOk) {
+                // try plane-based init using region ply if available
+                vector<Vector3d> prefPlane, ptgtPlane;
+                if(!ref.regionPly.empty() && !target.regionPly.empty()) {
+                    prefPlane = loadPly(ref.regionPly);
+                    ptgtPlane = loadPly(target.regionPly);
+                }
+                if(prefPlane.size() >= 50 && ptgtPlane.size() >= 50) {
+                    if(computeInitFromPlanePointClouds(ptgtPlane, prefPlane, T)) initOk = true;
+                }
+                if(!initOk) { cout << "초기 정합 실패: 마커 중심점 또는 평면 PLY를 확인하세요." << endl; continue; }
             }
 
             // 선택적 ICP (평면 ply가 양쪽 모두 있을 때)
@@ -1344,15 +1367,15 @@ int main(int argc, char **argv) try {
                 }
             };
 
-            // ICP 정련
+            // ICP 정련 (전체 포인트클라우드 사용)
             refineICP(ptgt, pref, T);
 
             // 결과 출력 및 저장
             cout << "\n변환 행렬 (Target -> Reference):" << endl;
             cout << T << endl;
 
-            // RMSE 계산 (최근접점 기반)
-            double rmse = computeNearestNeighborRMSE(ptgt, pref, T, 50.0);
+            // RMSE 계산 (중심점 기반)
+            double rmse = 0; for(size_t j = 0; j < target.centers.size(); j++) { Vector4d p(target.centers[j](0), target.centers[j](1), target.centers[j](2), 1); Vector4d q = T * p; Vector3d diff = q.head<3>() - ref.centers[j]; rmse += diff.squaredNorm(); } rmse = sqrt(rmse / std::max<size_t>(1, target.centers.size()));
             cout << "RMSE: " << rmse << " mm" << endl;
 
             string filename = "Transform_" + target.serial + "_to_" + ref.serial + "_" + nowTimestamp() + ".txt";
