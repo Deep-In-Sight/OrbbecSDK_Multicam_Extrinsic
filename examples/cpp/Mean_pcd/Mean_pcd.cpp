@@ -508,35 +508,7 @@ bool detectArUcoMarkers(const Mat &image, vector<Point2f> &corners, vector<int> 
     return false;
 }
 
-// ArUco 마커 중심점의 3D 좌표 추출
-vector<Vector3d> getArUcoCenterPoints(const vector<OBColorPoint>& pointCloud,
-                                      const vector<Point2f>& planeCorners,
-                                      uint32_t imageWidth, uint32_t imageHeight) {
-    vector<Vector3d> points3D;
-    
-    if(planeCorners.size() != EXPECTED_MARKERS) {
-        std::cout << "마커 중심점의 개수가 예상과 다릅니다!" << std::endl;
-        return points3D;
-    }
-
-    for (const auto& corner : planeCorners) {
-        int u = static_cast<int>(round(corner.x));
-        int v = static_cast<int>(round(corner.y));
-
-        if (u >= 0 && u < imageWidth && v >= 0 && v < imageHeight) {
-            int idx = v * imageWidth + u;
-            if (idx < pointCloud.size()) {
-                const auto& p = pointCloud[idx];
-                if (p.z > 0) { // 유효한 depth 값
-                    points3D.push_back(Vector3d(p.x, p.y, p.z));
-                }
-            }
-        }
-    }
-
-    std::cout << "추출된 ArUco 중심점 3D 좌표 수: " << points3D.size() << std::endl;
-    return points3D;
-}
+// getArUcoCenterPoints() 제거: 평면 기반 캘리브레이션으로 전환
 
 // SVD를 사용하여 변환 행렬 계산
 Matrix4d computeTransformationSVD(const vector<Vector3d>& sourcePoints,
@@ -586,6 +558,71 @@ Matrix4d computeTransformationSVD(const vector<Vector3d>& sourcePoints,
     T.block<3, 1>(0, 3) = t;
 
     return T;
+}
+
+// 평면 PCD로부터 PCA 기반 초기 정합 행렬 계산 (Target -> Reference)
+static bool computePlaneBasis(const vector<Vector3d>& pts, Vector3d& centroidOut, Matrix3d& basisOut) {
+    if(pts.size() < 10) return false;
+    centroidOut = Vector3d::Zero();
+    for(const auto& p : pts) centroidOut += p;
+    centroidOut /= (double)pts.size();
+    Matrix3d cov = Matrix3d::Zero();
+    for(const auto& p : pts) {
+        Vector3d d = p - centroidOut;
+        cov.noalias() += d * d.transpose();
+    }
+    SelfAdjointEigenSolver<Matrix3d> es(cov);
+    if(es.info() != Success) return false;
+    // eigenvalues ascending; evecs columns
+    Vector3d n = es.eigenvectors().col(0);      // smallest eigenvalue -> plane normal
+    Vector3d u = es.eigenvectors().col(2);      // largest eigenvalue  -> principal axis 1
+    // ensure orthonormal right-handed basis
+    n.normalize(); u.normalize();
+    Vector3d v = n.cross(u); v.normalize();
+    u = v.cross(n); u.normalize();
+    basisOut.col(0) = u; basisOut.col(1) = v; basisOut.col(2) = n;
+    return true;
+}
+
+static bool computeInitFromPlanePointClouds(const vector<Vector3d>& srcPts, const vector<Vector3d>& dstPts, Matrix4d& Tout) {
+    Vector3d cs, cd; Matrix3d Bs, Bd;
+    if(!computePlaneBasis(srcPts, cs, Bs)) return false;
+    if(!computePlaneBasis(dstPts, cd, Bd)) return false;
+    // align normal orientation
+    if(Bs.col(2).dot(Bd.col(2)) < 0) {
+        Bs.col(2) *= -1.0; Bs.col(1) *= -1.0; // keep right-handed
+    }
+    // rotation that maps src basis to dst basis
+    Matrix3d R = Bd * Bs.transpose();
+    if(R.determinant() < 0) {
+        // fix possible reflection due to eigenvector sign ambiguity
+        Matrix3d F = Matrix3d::Identity(); F(2,2) = -1.0; // flip normal axis
+        R = Bd * F * Bs.transpose();
+    }
+    Vector3d t = cd - R * cs;
+    Tout = Matrix4d::Identity();
+    Tout.block<3,3>(0,0) = R;
+    Tout.block<3,1>(0,3) = t;
+    return true;
+}
+
+static double computeNearestNeighborRMSE(const vector<Vector3d>& srcPts, const vector<Vector3d>& dstPts, const Matrix4d& T, double maxDist = 50.0) {
+    if(srcPts.empty() || dstPts.empty()) return -1.0;
+    double maxDist2 = maxDist * maxDist;
+    double sum = 0.0; int cnt = 0;
+    for(const auto& p : srcPts) {
+        Vector4d q(p.x(), p.y(), p.z(), 1.0);
+        q = T * q;
+        Vector3d ps = q.head<3>();
+        double best = 1e18;
+        for(const auto& d : dstPts) {
+            double dd = (ps - d).squaredNorm();
+            if(dd < best) best = dd;
+        }
+        if(best < maxDist2) { sum += best; cnt++; }
+    }
+    if(cnt == 0) return -1.0;
+    return sqrt(sum / (double)cnt);
 }
 
 // 안정적인 프레임셋 획득 함수
@@ -1072,39 +1109,23 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
             // 시각화 실패는 무시
         }
 
-        // JSON 메타데이터 저장
-        if(result.arucoFound) {
-            auto centerPoints = getArUcoCenterPoints(result.points, result.planeCorners, result.colorImage.cols, result.colorImage.rows);
-            if(centerPoints.size() == EXPECTED_MARKERS) {
-                cJSON *root = cJSON_CreateObject();
-                cJSON_AddStringToObject(root, "deviceSerial", result.deviceSerial.c_str());
-                cJSON_AddStringToObject(root, "timestamp", ts.c_str());
-                cJSON_AddBoolToObject(root, "arucoFound", result.arucoFound);
-                cJSON_AddStringToObject(root, "fullPly", fullPly.c_str());
-                if(!regionPly.empty()) cJSON_AddStringToObject(root, "regionPly", regionPly.c_str());
-                cJSON_AddStringToObject(root, "colorImage", imgFilename.c_str());
+        // JSON 메타데이터 저장: 캘리브레이션에 필요한 최소 필드만 저장
+        {
+            cJSON *root = cJSON_CreateObject();
+            cJSON_AddStringToObject(root, "deviceSerial", result.deviceSerial.c_str());
+            cJSON_AddStringToObject(root, "timestamp", ts.c_str());
+            if(!regionPly.empty()) cJSON_AddStringToObject(root, "regionPly", regionPly.c_str());
 
-                cJSON *pointsArray = cJSON_CreateArray();
-                for(const auto &p: centerPoints) {
-                    cJSON *point = cJSON_CreateObject();
-                    cJSON_AddNumberToObject(point, "x", p.x());
-                    cJSON_AddNumberToObject(point, "y", p.y());
-                    cJSON_AddNumberToObject(point, "z", p.z());
-                    cJSON_AddItemToArray(pointsArray, point);
-                }
-                cJSON_AddItemToObject(root, "arucoCenterPoints3D", pointsArray);
+            char *jsonString   = cJSON_Print(root);
+            string jsonFilename = prefix + ".json";
+            ofstream jsonFile(jsonFilename);
+            jsonFile << jsonString;
+            jsonFile.close();
 
-                char *jsonString   = cJSON_Print(root);
-                string jsonFilename = prefix + ".json";
-                ofstream jsonFile(jsonFilename);
-                jsonFile << jsonString;
-                jsonFile.close();
+            cout << "메타데이터 저장됨: " << jsonFilename << endl;
 
-                cout << "메타데이터 저장됨: " << jsonFilename << endl;
-
-                free(jsonString);
-                cJSON_Delete(root);
-            }
+            free(jsonString);
+            cJSON_Delete(root);
         }
         pipeline->stop();
     }
@@ -1173,7 +1194,7 @@ int main(int argc, char **argv) try {
         }
         else if(input == "c") {
             // 변환 행렬 계산 (파일 기반)
-            struct CalibEntry { string serial; string timestamp; vector<Vector3d> centers; string regionPly; };
+            struct CalibEntry { string serial; string timestamp; string regionPly; };
             vector<CalibEntry> entries;
 
             // 1. 현재 폴더에서 "capture_*.json" 파일 스캔
@@ -1192,19 +1213,9 @@ int main(int argc, char **argv) try {
                         if(!root) continue;
                         cJSON *serial = cJSON_GetObjectItem(root, "deviceSerial");
                         cJSON *ts     = cJSON_GetObjectItem(root, "timestamp");
-                        cJSON *found  = cJSON_GetObjectItem(root, "arucoFound");
-                        cJSON *pts    = cJSON_GetObjectItem(root, "arucoCenterPoints3D");
                         cJSON *rply   = cJSON_GetObjectItem(root, "regionPly");
-                        if(cJSON_IsString(serial) && cJSON_IsString(ts) && cJSON_IsBool(found) && found->valueint && cJSON_IsArray(pts) && cJSON_GetArraySize(pts) == 4) {
-                            CalibEntry ce; ce.serial = serial->valuestring; ce.timestamp = ts->valuestring; if(cJSON_IsString(rply)) ce.regionPly = rply->valuestring;
-                            for(int i = 0; i < 4; ++i) {
-                                cJSON *p = cJSON_GetArrayItem(pts, i);
-                                double x = cJSON_GetObjectItem(p, "x")->valuedouble;
-                                double y = cJSON_GetObjectItem(p, "y")->valuedouble;
-                                double z = cJSON_GetObjectItem(p, "z")->valuedouble;
-                                ce.centers.push_back({ x, y, z });
-                            }
-                            entries.push_back(ce);
+                        if(cJSON_IsString(serial) && cJSON_IsString(ts) && cJSON_IsString(rply)) {
+                            CalibEntry ce; ce.serial = serial->valuestring; ce.timestamp = ts->valuestring; ce.regionPly = rply->valuestring; entries.push_back(ce);
                         }
                         cJSON_Delete(root);
                     }
@@ -1236,10 +1247,8 @@ int main(int argc, char **argv) try {
             const auto &ref    = entries[refIndex];
             const auto &target = entries[targetIndex];
 
-            // SVD 초기 정합
-            Matrix4d T = computeTransformationSVD(target.centers, ref.centers);
-
-            // 선택적 ICP (평면 ply가 양쪽 모두 있을 때)
+            // 평면 PLY 로드 확인
+            if(ref.regionPly.empty() || target.regionPly.empty()) { cout << "선택된 항목에 평면 PLY 경로가 없습니다." << endl; continue; }
             auto loadPly = [](const string &path) {
                 vector<Vector3d> pts; pts.reserve(10000);
                 ifstream f(path); if(!f.is_open()) return pts;
@@ -1252,14 +1261,25 @@ int main(int argc, char **argv) try {
                         continue;
                     }
                     if(vertexCount <= 0) break;
-                    double x, y, z; int r, g, b; std::istringstream iss(line);
+                    double x, y, z; std::istringstream iss(line);
                     if(!(iss >> x >> y >> z)) continue;
                     pts.emplace_back(x, y, z);
-                    if((int)pts.size() >= 20000) break; // limit
+                    if((int)pts.size() >= 50000) break; // limit
                 }
                 return pts;
             };
 
+            vector<Vector3d> pref = loadPly(ref.regionPly);
+            vector<Vector3d> ptgt = loadPly(target.regionPly);
+            if(pref.size() < 50 || ptgt.size() < 50) { cout << "평면 포인트가 부족합니다." << endl; continue; }
+
+            // 평면 기반 SVD 초기 정합
+            Matrix4d T = Matrix4d::Identity();
+            if(!computeInitFromPlanePointClouds(ptgt, pref, T)) {
+                cout << "평면 기반 초기 정합 실패" << endl; continue;
+            }
+
+            // 선택적 ICP (평면 ply가 양쪽 모두 있을 때)
             auto downsample = [](vector<Vector3d> &pts, size_t maxN) {
                 if(pts.size() <= maxN) return;
                 std::mt19937 rng((uint32_t)time(nullptr));
@@ -1324,23 +1344,15 @@ int main(int argc, char **argv) try {
                 }
             };
 
-            if(!ref.regionPly.empty() && !target.regionPly.empty()) {
-                vector<Vector3d> pref = loadPly(ref.regionPly);
-                vector<Vector3d> ptgt = loadPly(target.regionPly);
-                if(!pref.empty() && !ptgt.empty()) {
-                    refineICP(ptgt, pref, T);
-                }
-            }
+            // ICP 정련
+            refineICP(ptgt, pref, T);
 
             // 결과 출력 및 저장
             cout << "\n변환 행렬 (Target -> Reference):" << endl;
             cout << T << endl;
 
-            // RMSE 계산 (중심점 기반)
-            double rmse = 0; for(size_t j = 0; j < target.centers.size(); j++) {
-                Vector4d p(target.centers[j](0), target.centers[j](1), target.centers[j](2), 1);
-                Vector4d q = T * p; Vector3d diff = q.head<3>() - ref.centers[j]; rmse += diff.squaredNorm();
-            } rmse = sqrt(rmse / target.centers.size());
+            // RMSE 계산 (최근접점 기반)
+            double rmse = computeNearestNeighborRMSE(ptgt, pref, T, 50.0);
             cout << "RMSE: " << rmse << " mm" << endl;
 
             string filename = "Transform_" + target.serial + "_to_" + ref.serial + "_" + nowTimestamp() + ".txt";
