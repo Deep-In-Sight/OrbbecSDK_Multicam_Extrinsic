@@ -1,6 +1,13 @@
 # Orbbec Multi-Camera Checkerboard Calibration System
 
-OrbbecSDK를 사용하여 여러 대의 RGB-D 카메라를 체커보드 캘리브레이션을 통해 하나의 좌표계로 통합하는 프로그램입니다.
+OrbbecSDK를 사용하여 여러 대의 RGB-D 카메라를 코너 네 곳 Aruco Marker 캘리브레이션을 통해 하나의 좌표계로 통합하는 프로그램입니다.
+
+![frame1_img](img/1.png)
+![frame1](img/Screenshot%20from%202025-08-19%2019-56-16.png)
+![frame2](img/2.jpeg)
+![frame2](img/Screenshot%20from%202025-08-19%2019-56-25.png)
+![result](img/Screenshot%20from%202025-08-19%2019-56-32.png)
+
 
 ## 주요 기능
 
@@ -13,10 +20,10 @@ OrbbecSDK를 사용하여 여러 대의 RGB-D 카메라를 체커보드 캘리�
    - 표준편차 기반 노이즈 필터링 (20% 임계값)
    - 중복 포인트 제거 후 하나의 포인트 클라우드로 병합
 
-3. **체커보드 검출 및 캘리브레이션**
-   - 11x8 체커보드 자동 검출
-   - OpenCV를 사용한 정밀한 코너 검출
-   - 체커보드 영역의 3D 포인트 추출
+3. **Aruco Marker Target 검출 및 캘리브레이션**
+   - Color image에서 4개의 Aruco marker 검출
+   - 각 마커 중점 3차원 좌표 획득
+   - SVD에 활용
 
 4. **SVD 기반 변환 행렬 계산**
    - 첫 번째 카메라를 기준 좌표계로 설정
@@ -30,6 +37,11 @@ OrbbecSDK를 사용하여 여러 대의 RGB-D 카메라를 체커보드 캘리�
 - OpenCV (>= 4.0)
 - Eigen3
 - CMake (>= 3.1.15)
+- libapriltag-dev
+```bash
+sudo apt-get update
+sudo apt-get install -y libapriltag-dev
+```
 
 ### 빌드 단계
 
@@ -43,10 +55,6 @@ make -j$(nproc)
 
 ## 실행 방법
 
-### 환경 설정
-```bash
-export LD_LIBRARY_PATH=/root/yeonsoo/OrbbecSDK/lib/linux_x64:$LD_LIBRARY_PATH
-```
 
 ### 프로그램 실행
 ```bash
@@ -64,9 +72,10 @@ export LD_LIBRARY_PATH=/root/yeonsoo/OrbbecSDK/lib/linux_x64:$LD_LIBRARY_PATH
 
 ### 캘리브레이션 프로세스
 
-1. 모든 카메라가 동일한 11x8 체커보드를 바라보도록 설치
+1. 모든 카메라가 동일한 Aruco Marker Target을 바라보도록 설치
 2. 프로그램 실행 후 'a' 입력으로 모든 디바이스 데이터 수집
-3. 'c' 입력으로 변환 행렬 계산
+3. 또는 디바이스 인덱스 직접 입력
+4. 'c' 입력으로 획득한 데이터로 변환 행렬 계산
 
 ## 출력 파일
 
@@ -81,11 +90,16 @@ export LD_LIBRARY_PATH=/root/yeonsoo/OrbbecSDK/lib/linux_x64:$LD_LIBRARY_PATH
   - 4x4 변환 행렬 (회전 + 이동)
   - RMSE 오차 정보 포함
 
-## 체커보드 사양
+## 타겟보드 사양
+- 정반사 되지 않는 흰색의 평평한 보드 사용
+![ArucoMarker](img/capture_testdevice_20250819_180736_color_roi_debug.png)
+- 코너 네곳 Top left, Top right, Bottom left, Bottom right 순서로 ID-0,1,2,3 부착
 
-- 크기: 11x8 (가로 x 세로)
-- 정사각형 크기: 30mm
-- 흑백 체커보드 패턴
+- ![ID0](img/aruco-0.svg)
+- ![ID1](img/aruco-1.svg)
+- ![ID2](img/aruco-2.svg)
+- ![ID3](img/aruco-3.svg)
+- 정사각형 크기: 상관 없음
 
 ## 기술적 세부사항
 
@@ -108,15 +122,14 @@ export LD_LIBRARY_PATH=/root/yeonsoo/OrbbecSDK/lib/linux_x64:$LD_LIBRARY_PATH
 
 1. 모든 카메라가 체커보드 전체를 명확하게 볼 수 있어야 함
 2. 체커보드는 평평하고 고정된 상태여야 함
-3. 충분한 조명이 필요함 (체커보드 검출용)
-4. 카메라와 체커보드 간 적절한 거리 유지 필요
+3. 카메라와 체커보드 간 적절한 거리 유지 필요
 
 ## 문제 해결
 
-### 체커보드를 찾을 수 없는 경우
+### Aruco Marker 4개를 찾을 수 없는 경우
 - 조명 상태 확인
-- 체커보드가 카메라 시야에 완전히 포함되는지 확인
-- 체커보드 표면이 평평한지 확인
+- 모든 Aruco marker가 카메라 시야에 완전히 포함되는지 확인
+- Aruco marker 표면이 평평한지 확인
 
 ### 변환 행렬 RMSE가 큰 경우
 - 체커보드 검출이 모든 카메라에서 정확한지 확인
@@ -126,3 +139,10 @@ export LD_LIBRARY_PATH=/root/yeonsoo/OrbbecSDK/lib/linux_x64:$LD_LIBRARY_PATH
 ### 라이브러리 로드 실패
 - LD_LIBRARY_PATH 환경 변수 확인
 - OrbbecSDK 라이브러리 경로 확인
+
+### transform_ply.py 사용법
+- 변환이 올바른지 시각화 하기 위한 파이썬 파일
+- open3d 설치 필요
+```bash
+python3 transform_ply.py <ply_file_to_transformation.ply> <Transform_A_to_B_result.txt>
+```
