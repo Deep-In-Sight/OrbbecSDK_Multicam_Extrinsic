@@ -37,11 +37,6 @@ OrbbecSDK를 사용하여 여러 대의 RGB-D 카메라를 코너 네 곳 Aruco 
 - OpenCV (>= 4.0)
 - Eigen3
 - CMake (>= 3.1.15)
-- libapriltag-dev
-```bash
-sudo apt-get update
-sudo apt-get install -y libapriltag-dev
-```
 
 ### 빌드 단계
 

@@ -50,16 +50,6 @@ else()
     message(FATAL_ERROR "Eigen3 not found!")
 endif()
 
-# AprilTag 찾기
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(APRILTAG REQUIRED apriltag)
-if(APRILTAG_FOUND)
-    include_directories(${APRILTAG_INCLUDE_DIRS})
-    message(STATUS "AprilTag found: ${APRILTAG_INCLUDE_DIRS}")
-else()
-    message(FATAL_ERROR "AprilTag not found!")
-endif()
-
 # 실행 파일 생성
 add_executable(${PROJECT_NAME} Mean_pcd.cpp)
 
