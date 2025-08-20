@@ -738,7 +738,7 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
         try {
             // Select the profile with the same frame rate as color.
             if(colorProfile) {
-                depthProfile = depthProfileList->getVideoStreamProfile(OB_WIDTH_ANY, OB_HEIGHT_ANY, OB_FORMAT_ANY, colorProfile->fps());
+                depthProfile = depthProfileList->getVideoStreamProfile(512, OB_HEIGHT_ANY, OB_FORMAT_ANY, colorProfile->fps());
             }
         }
         catch(...) {
@@ -778,6 +778,8 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
 	auto cameraParam      = pipeline->getCameraParam();
 	pointCloudFilter->setCameraParam(cameraParam);
 	auto calibParam       = pipeline->getCalibrationParam(config);
+
+    
     
     auto init_depth_frame = init_frameset->depthFrame();
     auto init_color_frame = init_frameset->colorFrame();
@@ -785,6 +787,9 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
     const uint32_t depth_width  = init_depth_frame->width();
     const uint32_t depth_height = init_depth_frame->height();
     const uint32_t depth_size   = depth_width * depth_height;
+
+    cout << "Depth frame info: " << depth_width << "x" << depth_height << endl;
+
     const uint32_t color_width  = colorProfile ? colorProfile->width() : init_color_frame->width();
     const uint32_t color_height = colorProfile ? colorProfile->height() : init_color_frame->height();
     
