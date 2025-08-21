@@ -36,7 +36,13 @@ OrbbecSDK를 사용하여 여러 대의 RGB-D 카메라를 코너 네 곳 Aruco 
 - OrbbecSDK
 - OpenCV (>= 4.0)
 - Eigen3
+- PCL (Point Cloud Library >= 1.7)
 - CMake (>= 3.1.15)
+
+Ubuntu/Debian 기반 시스템에서는 다음 명령어로 PCL을 설치할 수 있습니다:
+```bash
+sudo apt-get update && sudo apt-get install -y libpcl-dev
+```
 
 ### 빌드 단계
 

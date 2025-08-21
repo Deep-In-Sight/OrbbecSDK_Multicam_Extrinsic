@@ -21,6 +21,16 @@
 #include <cstdio>
 #include <limits>
 
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/registration/icp.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/ModelCoefficients.h>
+#include <pcl/sample_consensus/method_types.h>
+#include <pcl/sample_consensus/model_types.h>
+#include <pcl/segmentation/sac_segmentation.h>
+
 #include "cJSON.h"
 #include <libobsensor/hpp/Utils.hpp>
 
@@ -972,12 +982,7 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
 
     // 2) 전체 포인트클라우드 순회 → 3D를 Color로 투영 → ROI 내부만 plane 영역으로 수집
     result.regionPoints.clear();
-    vector<Vector3d> centerPoints3D; // 후에 JSON 저장 및 SVD 초기값에 사용
     if(pcFrame && pcFrame->dataSize() > 0 && result.regionDefiningCorners.size() == 4) {
-        // 마커 중심 근처의 최근접 3D 포인트 추정용
-        vector<Vector3d> bestCenter3D(result.regionDefiningCorners.size(), Vector3d(0,0,0));
-        vector<double>  bestCenterD2(result.regionDefiningCorners.size(), 1e18);
-
         int n = pcFrame->dataSize() / sizeof(OBPoint3f);
         const OBPoint3f *pts = (const OBPoint3f *)pcFrame->data();
         for(int i = 0; i < n; ++i) {
@@ -992,17 +997,72 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
                 cp.b = bgr[0]; cp.g = bgr[1]; cp.r = bgr[2];
                 result.regionPoints.push_back(cp);
             }
-            // 각 마커 중심 픽셀에 가장 가까운 투영 포인트를 3D로 기록
-            for(size_t k = 0; k < result.regionDefiningCorners.size(); ++k) {
-                double dx = uv.x - result.regionDefiningCorners[k].x;
-                double dy = uv.y - result.regionDefiningCorners[k].y;
-                double d2 = dx*dx + dy*dy;
-                if(d2 < bestCenterD2[k]) { bestCenterD2[k] = d2; bestCenter3D[k] = Vector3d(P.x, P.y, P.z); }
+        }
+    }
+
+    // 3) RANSAC 평면 피팅과 광선 교차를 통한 정밀 3D 코너 추정
+    vector<Vector3d> centerPoints3D; // 최종 3D 코너 포인트
+    if(result.regionPoints.size() >= 100) {
+        // PCL 포인트 클라우드로 변환
+        pcl::PointCloud<pcl::PointXYZ>::Ptr regionCloud(new pcl::PointCloud<pcl::PointXYZ>);
+        regionCloud->points.reserve(result.regionPoints.size());
+        for(const auto& p : result.regionPoints) {
+            regionCloud->points.emplace_back(p.x, p.y, p.z);
+        }
+
+        // RANSAC으로 평면 모델 피팅
+        pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
+        pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+        pcl::SACSegmentation<pcl::PointXYZ> seg;
+        seg.setOptimizeCoefficients(true);
+        seg.setModelType(pcl::SACMODEL_PLANE);
+        seg.setMethodType(pcl::SAC_RANSAC);
+        seg.setDistanceThreshold(5.0); // 5mm
+        seg.setInputCloud(regionCloud);
+        seg.segment(*inliers, *coefficients);
+
+        if (coefficients->values.size() >= 4) {
+            cout << "RANSAC plane model fitted. Calculating corners by ray-plane intersection." << endl;
+            Vector4d plane_coeffs(coefficients->values[0], coefficients->values[1], coefficients->values[2], coefficients->values[3]);
+            plane_coeffs /= plane_coeffs.head<3>().norm(); // 정규화
+
+            // 2D 코너에서 3D 광선을 생성하고 평면과 교차시켜 정밀한 3D 코너 좌표 계산
+            for (const auto& corner_2d : result.regionDefiningCorners) {
+                OBPoint2f corner_ob = { corner_2d.x, corner_2d.y };
+                OBPoint3f p1 = {}, p2 = {};
+
+                // 2D 점을 깊이 값 두 개로 3D 공간(뎁스 센서 좌표계)에 투영하여 광선의 두 점을 생성
+                bool p1_ok = CoordinateTransformHelper::calibration2dTo3d(calibParam, corner_ob, 1000.0f, OB_SENSOR_COLOR, OB_SENSOR_DEPTH, &p1);
+                bool p2_ok = CoordinateTransformHelper::calibration2dTo3d(calibParam, corner_ob, 2000.0f, OB_SENSOR_COLOR, OB_SENSOR_DEPTH, &p2);
+
+                if (p1_ok && p2_ok) {
+                    Vector3d ray_origin(p1.x, p1.y, p1.z);
+                    Vector3d ray_dir(p2.x - p1.x, p2.y - p1.y, p2.z - p1.z);
+                    ray_dir.normalize();
+
+                    Vector3d plane_normal = plane_coeffs.head<3>();
+                    double plane_d = plane_coeffs[3];
+
+                    // 광선-평면 교차점 계산
+                    double n_dot_d = plane_normal.dot(ray_dir);
+                    if (std::abs(n_dot_d) > 1e-6) {
+                        double t = (-plane_d - plane_normal.dot(ray_origin)) / n_dot_d;
+                        Vector3d intersection_point = ray_origin + t * ray_dir;
+                        centerPoints3D.push_back(intersection_point);
+                    }
+                }
             }
+            if(centerPoints3D.size() != 4) {
+                 cout << "Warning: Failed to calculate all 4 corner points via ray-plane intersection. Result might be inaccurate." << endl;
+                 centerPoints3D.clear();
+            } else {
+                cout << "Successfully calculated 4 corner points on the robust plane." << endl;
+            }
+        } else {
+            cout << "Warning: Could not estimate a plane model from the region points." << endl;
         }
-        for(size_t k = 0; k < bestCenter3D.size(); ++k) {
-            if(bestCenterD2[k] < 1e18) centerPoints3D.push_back(bestCenter3D[k]);
-        }
+    } else {
+        cout << "Warning: Not enough points in plane region to perform robust corner estimation." << endl;
     }
 
     std::cout << "result.regionDefiningCorners: " << result.regionDefiningCorners.size() << std::endl;
@@ -1089,19 +1149,18 @@ int main(int argc, char **argv) try {
     auto devList = ctx.queryDeviceList();
     uint32_t deviceCount = devList->deviceCount();
     
-    if(deviceCount == 0) {
-        cerr << "연결된 디바이스가 없습니다!" << endl;
-        return -1;
-    }
-    
     cout << "\n=== Orbbec 체커보드 캘리브레이션 시스템 ===" << endl;
-    cout << "발견된 디바이스 수: " << deviceCount << endl << endl;
-    
-    // 디바이스 목록 표시
-    for(uint32_t i = 0; i < deviceCount; i++) {
-        auto dev = devList->getDevice(i);
-        auto info = dev->getDeviceInfo();
-        cout << "[" << i << "] " << info->name() << " - Serial: " << info->serialNumber() << endl;
+    if(deviceCount == 0) {
+        cout << "연결된 디바이스가 없습니다! 파일 기반 캘리브레이션('c')만 가능합니다." << endl;
+    }
+    else {
+        cout << "발견된 디바이스 수: " << deviceCount << endl << endl;
+        // 디바이스 목록 표시
+        for(uint32_t i = 0; i < deviceCount; i++) {
+            auto dev = devList->getDevice(i);
+            auto info = dev->getDeviceInfo();
+            cout << "[" << i << "] " << info->name() << " - Serial: " << info->serialNumber() << endl;
+        }
     }
     
     // 평균을 계산할 프레임 수들
@@ -1113,8 +1172,10 @@ int main(int argc, char **argv) try {
     // 사용자 입력 루프
     while(true) {
         cout << "\n명령어:" << endl;
-        cout << "  [0-" << (deviceCount-1) << "] : 해당 인덱스의 디바이스 처리" << endl;
-        cout << "  a : 모든 디바이스 순차 처리" << endl;
+        if(deviceCount > 0) {
+            cout << "  [0-" << (deviceCount - 1) << "] : 해당 인덱스의 디바이스 처리" << endl;
+            cout << "  a : 모든 디바이스 순차 처리" << endl;
+        }
         cout << "  c : 수집된 데이터로 변환 행렬 계산" << endl;
         cout << "  q : 종료" << endl;
         cout << "선택: ";
@@ -1126,6 +1187,10 @@ int main(int argc, char **argv) try {
             break;
         }
         else if(input == "a") {
+            if(deviceCount == 0) {
+                cout << "연결된 디바이스가 없어 'a' 명령을 실행할 수 없습니다." << endl;
+                continue;
+            }
             // 모든 디바이스 처리
             processedDevices.clear();
             for(uint32_t i = 0; i < deviceCount; i++) {
@@ -1207,12 +1272,11 @@ int main(int argc, char **argv) try {
             const auto &ref    = entries[refIndex];
             const auto &target = entries[targetIndex];
 
-            // 전체 PLY 로드 확인
-            if(ref.fullPly.empty() || target.fullPly.empty()) { cout << "선택된 항목에 전체 PLY 경로가 없습니다." << endl; continue; }
             auto loadPly = [](const string &path) {
-                vector<Vector3d> pts; pts.reserve(10000);
+                vector<Vector3d> pts; pts.reserve(50000);
                 ifstream f(path); if(!f.is_open()) return pts;
-                string line; bool header = true; int vertexCount = 0; while(getline(f, line)) {
+                string line; bool header = true; int vertexCount = 0;
+                while(getline(f, line)) {
                     if(header) {
                         if(line.rfind("element vertex", 0) == 0) {
                             sscanf(line.c_str(), "element vertex %d", &vertexCount);
@@ -1220,41 +1284,77 @@ int main(int argc, char **argv) try {
                         if(line == "end_header") header = false;
                         continue;
                     }
-                    if(vertexCount <= 0) break;
+                    if(vertexCount > 0 && (int)pts.size() >= vertexCount) break;
                     double x, y, z; std::istringstream iss(line);
                     if(!(iss >> x >> y >> z)) continue;
                     pts.emplace_back(x, y, z);
-                    if((int)pts.size() >= 50000) break; // limit
+                    if((int)pts.size() >= 50000) break; // Safety limit
                 }
                 return pts;
             };
-            vector<Vector3d> pref = loadPly(ref.fullPly);
-            vector<Vector3d> ptgt = loadPly(target.fullPly);
-            if(pref.size() < 50 || ptgt.size() < 50) { cout << "전체 포인트가 부족합니다." << endl; continue; }
 
-            // SVD 초기 정합 (이전 방식 유지: 마커 중심 3D 기반). 필요 시 평면 PLY 기반 폴백
+            // Load PLY files for ICP: prefer region (plane) points, fallback to full point cloud
+            vector<Vector3d> pref, ptgt;
+            bool useRegionPly = false;
+            if(!ref.regionPly.empty() && !target.regionPly.empty()) {
+                cout << "Attempting to load region PLY files for ICP..." << endl;
+                pref = loadPly(ref.regionPly);
+                ptgt = loadPly(target.regionPly);
+                if(pref.size() >= 100 && ptgt.size() >= 100) {
+                    cout << "Successfully loaded region PLY files." << endl;
+                    useRegionPly = true;
+                } else {
+                    cout << "Region PLY files are too small or failed to load. Falling back to full PLY files." << endl;
+                }
+            }
+
+            if(!useRegionPly) {
+                cout << "Loading full PLY files for ICP..." << endl;
+                if(ref.fullPly.empty() || target.fullPly.empty()) {
+                    cout << "Selected items do not have full PLY paths." << endl;
+                    continue;
+                }
+                pref = loadPly(ref.fullPly);
+                ptgt = loadPly(target.fullPly);
+            }
+
+            if(pref.size() < 100 || ptgt.size() < 100) {
+                cout << "Not enough points in the point clouds to proceed with ICP." << endl;
+                continue;
+            }
+
+            // Initial Alignment: Prioritize SVD on corner points, fallback to PCA on plane point clouds.
             Matrix4d T = Matrix4d::Identity();
             bool initOk = false;
-            if(ref.innerCornerPoints3D.size() >= 3 && target.innerCornerPoints3D.size() >= 3 && ref.innerCornerPoints3D.size() == target.innerCornerPoints3D.size()) {
+
+            if(ref.innerCornerPoints3D.size() >= 4 && ref.innerCornerPoints3D.size() == target.innerCornerPoints3D.size()) {
+                cout << "Performing initial alignment using SVD on inner corner points..." << endl;
                 try {
                     T = computeTransformationSVD(target.innerCornerPoints3D, ref.innerCornerPoints3D);
                     initOk = true;
-                } catch(...) { initOk = false; }
-            }
-            if(!initOk) {
-                // try plane-based init using region ply if available
-                vector<Vector3d> prefPlane, ptgtPlane;
-                if(!ref.regionPly.empty() && !target.regionPly.empty()) {
-                    prefPlane = loadPly(ref.regionPly);
-                    ptgtPlane = loadPly(target.regionPly);
+                    cout << "SVD initial alignment successful." << endl;
+                } catch(...) {
+                    initOk = false;
+                    cout << "SVD initial alignment failed. Falling back to PCA..." << endl;
                 }
-                if(prefPlane.size() >= 50 && ptgtPlane.size() >= 50) {
-                    if(computeInitFromPlanePointClouds(ptgtPlane, prefPlane, T)) initOk = true;
-                }
-                if(!initOk) { cout << "초기 정합 실패: 마커 중심점 또는 평면 PLY를 확인하세요." << endl; continue; }
             }
 
-            // 선택적 ICP (평면 ply가 양쪽 모두 있을 때)
+            if(!initOk && useRegionPly) {
+                cout << "Performing initial alignment using PCA on plane point clouds as fallback..." << endl;
+                if(computeInitFromPlanePointClouds(ptgt, pref, T)) {
+                    initOk = true;
+                    cout << "PCA initial alignment successful." << endl;
+                } else {
+                    cout << "PCA initial alignment also failed." << endl;
+                }
+            }
+
+            if(!initOk) {
+                cout << "Initial alignment failed. Cannot proceed with ICP." << endl;
+                continue;
+            }
+
+            // ICP 정련 (전체 포인트클라우드 사용)
             auto downsample = [](vector<Vector3d> &pts, size_t maxN) {
                 if(pts.size() <= maxN) return;
                 std::mt19937 rng((uint32_t)time(nullptr));
@@ -1262,90 +1362,82 @@ int main(int argc, char **argv) try {
                 pts.resize(maxN);
             };
 
-            auto refineICP = [&](const vector<Vector3d> &src0, const vector<Vector3d> &dst0, Matrix4d &Tinout) {
-                vector<Vector3d> src = src0, dst = dst0;
-                downsample(src, 8000); downsample(dst, 8000);
-                double maxDist2 = 30.0 * 30.0;
+            auto refineICP = [&](const vector<Vector3d> &src0, const vector<Vector3d> &dst0, Matrix4d &Tinout,
+                                 const vector<Vector3d>& target_corners, const vector<Vector3d>& ref_corners) {
+                // 1. Data Preparation
+                pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_in(new pcl::PointCloud<pcl::PointXYZ>);
+                cloud_in->points.reserve(src0.size());
+                for(const auto &p: src0) cloud_in->points.emplace_back(p.x(), p.y(), p.z());
 
-                Matrix4d bestT = Tinout;
-                double minRmse = std::numeric_limits<double>::max();
+                pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_target(new pcl::PointCloud<pcl::PointXYZ>);
+                cloud_target->points.reserve(dst0.size());
+                for(const auto &p: dst0) cloud_target->points.emplace_back(p.x(), p.y(), p.z());
 
-                double initialRmse = computeNearestNeighborRMSE(src0, dst0, Tinout, 30.0);
-                if(initialRmse >= 0) {
-                    minRmse = initialRmse;
-                    cout << "Initial RMSE: " << minRmse << " mm" << endl;
+                cout << "Starting Iterative PCL Point-to-Point ICP refinement..." << endl;
+                cout << "Source points: " << cloud_in->size() << ", Target points: " << cloud_target->size() << endl;
+
+                Matrix4f current_transform = Tinout.cast<float>();
+                Matrix4f best_transform = current_transform;
+
+                auto calculate_rmse = [&](const Matrix4f& transform) {
+                    if (target_corners.empty() || ref_corners.empty() || target_corners.size() != ref_corners.size()) return -1.0;
+                    double rmse_sum = 0.0;
+                    for (size_t j = 0; j < target_corners.size(); j++) {
+                        Eigen::Vector4f p_target_h(target_corners[j](0), target_corners[j](1), target_corners[j](2), 1.0);
+                        Eigen::Vector4f p_ref_h = transform * p_target_h;
+                        Eigen::Vector3d diff = p_ref_h.head<3>().cast<double>() - ref_corners[j];
+                        rmse_sum += diff.squaredNorm();
+                    }
+                    return sqrt(rmse_sum / target_corners.size());
+                };
+
+                double min_rmse = calculate_rmse(best_transform);
+                if(min_rmse >= 0) {
+                    cout << "Initial Corner RMSE: " << min_rmse << " mm" << endl;
                 }
 
-                for(int iter = 0; iter < 20; ++iter) {
-                    cout << "ICP Iteration [" << iter + 1 << "/20]" << endl;
-                    vector<Vector3d> s, d;
-                    // transform src by Tinout
-                    for(const auto &p: src) {
-                        Vector4d q(p.x(), p.y(), p.z(), 1.0);
-                        q = Tinout * q; s.emplace_back(q.x(), q.y(), q.z());
-                    }
-                    // brute-force nearest neighbor
-                    int used = 0;
-                    for(const auto &ps: s) {
-                        double best = 1e18; int bi = -1; for(size_t j = 0; j < dst.size(); ++j) {
-                            double dd = (ps - dst[j]).squaredNorm(); if(dd < best) { best = dd; bi = (int)j; }
-                        }
-                        if(best < maxDist2 && bi >= 0) { d.push_back(dst[bi]); used++; }
-                    }
-                    if(d.size() < 50) break;
-                    // compute SVD between s' and d
-                    Vector3d cs = Vector3d::Zero(), cd = Vector3d::Zero();
-                    for(size_t i = 0, k = 0; i < s.size(); ++i) {
-                        Vector3d ps = s[i];
-                        // paired only if within threshold
-                        double best = 1e18; int bi = -1; for(size_t j = 0; j < dst.size(); ++j) {
-                            double dd = (ps - dst[j]).squaredNorm(); if(dd < best) { best = dd; bi = (int)j; }
-                        }
-                        if(best >= maxDist2 || bi < 0) continue;
-                        cs += ps; cd += dst[bi];
-                    }
-                    int N = 0;
-                    for(const auto &ps: s) {
-                        double best = 1e18; int bi = -1; for(size_t j = 0; j < dst.size(); ++j) {
-                            double dd = (ps - dst[j]).squaredNorm(); if(dd < best) { best = dd; bi = (int)j; }
-                        }
-                        if(best < maxDist2) N++;
-                    }
-                    if(N < 50) break;
-                    cs /= N; cd /= N;
-                    MatrixXd H(3, 3); H.setZero();
-                    for(const auto &ps: s) {
-                        double best = 1e18; int bi = -1; for(size_t j = 0; j < dst.size(); ++j) {
-                            double dd = (ps - dst[j]).squaredNorm(); if(dd < best) { best = dd; bi = (int)j; }
-                        }
-                        if(best >= maxDist2 || bi < 0) continue;
-                        H += (ps - cs) * (dst[bi] - cd).transpose();
-                    }
-                    JacobiSVD<Matrix3d> svd(H, ComputeFullU | ComputeFullV);
-                    Matrix3d R = svd.matrixV() * svd.matrixU().transpose();
-                    if(R.determinant() < 0) { Matrix3d V = svd.matrixV(); V.col(2) *= -1; R = V * svd.matrixU().transpose(); }
-                    Vector3d t = cd - R * cs;
-                    Matrix4d dT = Matrix4d::Identity(); dT.block<3, 3>(0, 0) = R; dT.block<3, 1>(0, 3) = t;
-                    Tinout = dT * Tinout;
+                // 2. Iterative Point-to-Point ICP
+                pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+                icp.setInputSource(cloud_in);
+                icp.setInputTarget(cloud_target);
+                icp.setMaximumIterations(300);
+                icp.setTransformationEpsilon(1e-9);
+                icp.setEuclideanFitnessEpsilon(1e-5);
 
-                    double currentRmse = computeNearestNeighborRMSE(src0, dst0, Tinout, 30.0);
-
-                    if((iter + 1) % 2 == 0 && currentRmse >= 0) {
-                        cout << "  - RMSE at iteration " << iter + 1 << ": " << currentRmse << " mm" << endl;
-                    }
-
-                    if(currentRmse >= 0 && currentRmse < minRmse) {
-                        minRmse = currentRmse;
-                        bestT = Tinout;
-                        cout << "  - New best RMSE found: " << minRmse << " mm" << endl;
+                // Start with a small correspondence distance for fine-tuning an already good alignment
+                vector<double> correspondence_distances = {10.0, 8.0, 6.0, 5.0, 4.0, 3.0};
+                for(size_t i = 0; i < correspondence_distances.size(); ++i) {
+                    cout << "  - ICP iteration " << i + 1 << " with correspondence distance: " << correspondence_distances[i] << "mm" << endl;
+                    icp.setMaxCorrespondenceDistance(correspondence_distances[i]);
+                    
+                    pcl::PointCloud<pcl::PointXYZ> final_cloud;
+                    icp.align(final_cloud, current_transform);
+                    
+                    if(icp.hasConverged()) {
+                        current_transform = icp.getFinalTransformation();
+                        double current_rmse = calculate_rmse(current_transform);
+                        
+                        cout << "    Converged. Score: " << icp.getFitnessScore() << ". Corner RMSE: " << current_rmse << " mm";
+                        
+                        if (current_rmse >= 0 && current_rmse < min_rmse) {
+                            min_rmse = current_rmse;
+                            best_transform = current_transform;
+                            cout << " => New best RMSE found!" << endl;
+                        } else {
+                            cout << endl;
+                        }
+                    } else {
+                        cout << "    Iteration FAILED to converge." << endl;
+                        break; 
                     }
                 }
-                Tinout = bestT;
-                cout << "\nICP refinement finished. Best RMSE: " << minRmse << " mm" << endl;
+
+                Tinout = best_transform.cast<double>();
+                cout << "\nICP refinement finished. Best Corner RMSE: " << min_rmse << " mm" << endl;
             };
 
             // ICP 정련 (전체 포인트클라우드 사용)
-            refineICP(ptgt, pref, T);
+            refineICP(ptgt, pref, T, target.innerCornerPoints3D, ref.innerCornerPoints3D);
 
             // 결과 출력 및 저장
             cout << "\n변환 행렬 (Target -> Reference):" << endl;
@@ -1366,34 +1458,40 @@ int main(int argc, char **argv) try {
             }
         }
         else {
-            // 개별 디바이스 처리
-            try {
-                int deviceIndex = stoi(input);
-                if(deviceIndex >= 0 && deviceIndex < deviceCount) {
-                    cout << "\n디바이스 " << deviceIndex << " 처리 시작..." << endl;
-                    auto dev = devList->getDevice(deviceIndex);
-                    auto data = processSingleDevice(dev, meanFrameNums);
-                    
-                    // 이미 처리된 디바이스인지 확인
-                    bool found = false;
-                    for(auto& pd : processedDevices) {
-                        if(pd.deviceSerial == data.deviceSerial) {
-                            pd = data;  // 업데이트
-                            found = true;
-                            break;
+            if(deviceCount > 0) {
+                // 개별 디바이스 처리
+                try {
+                    int deviceIndex = stoi(input);
+                    if(deviceIndex >= 0 && deviceIndex < (int)deviceCount) {
+                        cout << "\n디바이스 " << deviceIndex << " 처리 시작..." << endl;
+                        auto dev = devList->getDevice(deviceIndex);
+                        auto data = processSingleDevice(dev, meanFrameNums);
+
+                        // 이미 처리된 디바이스인지 확인
+                        bool found = false;
+                        for(auto &pd: processedDevices) {
+                            if(pd.deviceSerial == data.deviceSerial) {
+                                pd    = data; // 업데이트
+                                found = true;
+                                break;
+                            }
                         }
+                        if(!found) {
+                            processedDevices.push_back(data);
+                        }
+
+                        cout << "디바이스 " << deviceIndex << " 처리 완료!" << endl;
                     }
-                    if(!found) {
-                        processedDevices.push_back(data);
+                    else {
+                        cout << "잘못된 디바이스 인덱스입니다!" << endl;
                     }
-                    
-                    cout << "디바이스 " << deviceIndex << " 처리 완료!" << endl;
-                } else {
-                    cout << "잘못된 디바이스 인덱스입니다!" << endl;
+                }
+                catch(...) {
+                    cout << "잘못된 입력입니다!" << endl;
                 }
             }
-            catch(...) {
-                cout << "잘못된 입력입니다!" << endl;
+            else {
+                cout << "잘못된 입력입니다! 'c' 또는 'q'를 입력하세요." << endl;
             }
         }
     }

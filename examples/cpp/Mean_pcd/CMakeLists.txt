@@ -50,6 +50,15 @@ else()
     message(FATAL_ERROR "Eigen3 not found!")
 endif()
 
+# PCL 찾기
+find_package(PCL 1.7 REQUIRED)
+if(PCL_FOUND)
+    include_directories(${PCL_INCLUDE_DIRS})
+    message(STATUS "PCL found: ${PCL_VERSION}")
+else()
+    message(FATAL_ERROR "PCL not found!")
+endif()
+
 # 실행 파일 생성
 add_executable(${PROJECT_NAME} Mean_pcd.cpp)
 
@@ -72,6 +81,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         ${OpenCV_LIBS}
         ${CMAKE_THREAD_LIBS_INIT}
         ${APRILTAG_LIBRARIES}
+        ${PCL_LIBRARIES}
         -lpthread
         -lm
     )
@@ -79,11 +89,13 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_link_libraries(${PROJECT_NAME}
         OrbbecSDK
         ${OpenCV_LIBS}
+        ${PCL_LIBRARIES}
     )
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     target_link_libraries(${PROJECT_NAME}
         -lOrbbecSDK
         ${OpenCV_LIBS}
+        ${PCL_LIBRARIES}
         -lpthread
         -lm
     )
