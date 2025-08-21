@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <sstream>
 #include <cstdio>
+#include <limits>
 
 #include "cJSON.h"
 #include <libobsensor/hpp/Utils.hpp>
@@ -467,6 +468,8 @@ bool detectArUcoMarkers(const Mat &image, vector<Point2f> &corners, vector<int> 
             planeCorners.clear();
             markerCornerMap.clear();
 
+            // 1. 마커 코너 및 중심점 계산
+            map<int, Point2f> markerCenters;
             for(const auto &marker: markersWithIds) {
                 corners.insert(corners.end(), marker.second.begin(), marker.second.end());
                 markerCornerMap[marker.first] = marker.second;
@@ -474,7 +477,34 @@ bool detectArUcoMarkers(const Mat &image, vector<Point2f> &corners, vector<int> 
                 Point2f center(0, 0);
                 for(const auto &corner: marker.second) center += corner;
                 center *= 0.25f;
-                planeCorners.push_back(center);
+                markerCenters[marker.first] = center;
+            }
+
+            // 2. 평면 중심 계산
+            Point2f planeCenter(0, 0);
+            if(!markerCenters.empty()) {
+                for(const auto &pair: markerCenters) {
+                    planeCenter += pair.second;
+                }
+                planeCenter *= (1.0f / markerCenters.size());
+            }
+
+            // 3. 각 마커에 대해 평면 중심에 가장 가까운 코너를 찾아 planeCorners에 추가
+            for(const auto &marker: markersWithIds) {
+                const auto &currentMarkerCorners = marker.second;
+                Point2f closestCorner            = currentMarkerCorners[0];
+                double  minDistanceSq            = -1.0;
+
+                for(const auto &corner: currentMarkerCorners) {
+                    double dx         = corner.x - planeCenter.x;
+                    double dy         = corner.y - planeCenter.y;
+                    double distanceSq = dx * dx + dy * dy;
+                    if(minDistanceSq < 0 || distanceSq < minDistanceSq) {
+                        minDistanceSq = distanceSq;
+                        closestCorner = corner;
+                    }
+                }
+                planeCorners.push_back(closestCorner);
             }
 
             // 내부 코너 기반 폴리곤 산출 (ID 매핑: 0:TL,1:TR,2:BL,3:BR)
@@ -882,6 +912,7 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
             }
         }
     }
+    destroyAllWindows();
     
     // 평균 depth 계산용 프레임셋 획득
     shared_ptr<ob::FrameSet> target_frameset = getStableFrameset(pipeline, 5, 2000);
@@ -944,8 +975,8 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
     vector<Vector3d> centerPoints3D; // 후에 JSON 저장 및 SVD 초기값에 사용
     if(pcFrame && pcFrame->dataSize() > 0 && result.regionDefiningCorners.size() == 4) {
         // 마커 중심 근처의 최근접 3D 포인트 추정용
-        vector<Vector3d> bestCenter3D(result.planeCorners.size(), Vector3d(0,0,0));
-        vector<double>  bestCenterD2(result.planeCorners.size(), 1e18);
+        vector<Vector3d> bestCenter3D(result.regionDefiningCorners.size(), Vector3d(0,0,0));
+        vector<double>  bestCenterD2(result.regionDefiningCorners.size(), 1e18);
 
         int n = pcFrame->dataSize() / sizeof(OBPoint3f);
         const OBPoint3f *pts = (const OBPoint3f *)pcFrame->data();
@@ -962,9 +993,9 @@ PointCloudData processSingleDevice(shared_ptr<ob::Device> device,
                 result.regionPoints.push_back(cp);
             }
             // 각 마커 중심 픽셀에 가장 가까운 투영 포인트를 3D로 기록
-            for(size_t k = 0; k < result.planeCorners.size(); ++k) {
-                double dx = uv.x - result.planeCorners[k].x;
-                double dy = uv.y - result.planeCorners[k].y;
+            for(size_t k = 0; k < result.regionDefiningCorners.size(); ++k) {
+                double dx = uv.x - result.regionDefiningCorners[k].x;
+                double dy = uv.y - result.regionDefiningCorners[k].y;
                 double d2 = dx*dx + dy*dy;
                 if(d2 < bestCenterD2[k]) { bestCenterD2[k] = d2; bestCenter3D[k] = Vector3d(P.x, P.y, P.z); }
             }
@@ -1110,7 +1141,7 @@ int main(int argc, char **argv) try {
         }
         else if(input == "c") {
             // 변환 행렬 계산 (파일 기반)
-            struct CalibEntry { string serial; string timestamp; vector<Vector3d> centers; string regionPly; string fullPly; };
+            struct CalibEntry { string serial; string timestamp; vector<Vector3d> innerCornerPoints3D; string regionPly; string fullPly; };
             vector<CalibEntry> entries;
 
             // 1. 현재 폴더에서 "capture_*.json" 파일 스캔
@@ -1139,7 +1170,7 @@ int main(int argc, char **argv) try {
                             for(int i = 0; i < n; ++i) {
                                 cJSON *p = cJSON_GetArrayItem(pts, i);
                                 cJSON *xx = cJSON_GetObjectItem(p, "x"); cJSON *yy = cJSON_GetObjectItem(p, "y"); cJSON *zz = cJSON_GetObjectItem(p, "z");
-                                if(cJSON_IsNumber(xx) && cJSON_IsNumber(yy) && cJSON_IsNumber(zz)) ce.centers.push_back(Vector3d(xx->valuedouble, yy->valuedouble, zz->valuedouble));
+                                if(cJSON_IsNumber(xx) && cJSON_IsNumber(yy) && cJSON_IsNumber(zz)) ce.innerCornerPoints3D.push_back(Vector3d(xx->valuedouble, yy->valuedouble, zz->valuedouble));
                             }
                             entries.push_back(ce);
                         }
@@ -1204,9 +1235,9 @@ int main(int argc, char **argv) try {
             // SVD 초기 정합 (이전 방식 유지: 마커 중심 3D 기반). 필요 시 평면 PLY 기반 폴백
             Matrix4d T = Matrix4d::Identity();
             bool initOk = false;
-            if(ref.centers.size() >= 3 && target.centers.size() >= 3 && ref.centers.size() == target.centers.size()) {
+            if(ref.innerCornerPoints3D.size() >= 3 && target.innerCornerPoints3D.size() >= 3 && ref.innerCornerPoints3D.size() == target.innerCornerPoints3D.size()) {
                 try {
-                    T = computeTransformationSVD(target.centers, ref.centers);
+                    T = computeTransformationSVD(target.innerCornerPoints3D, ref.innerCornerPoints3D);
                     initOk = true;
                 } catch(...) { initOk = false; }
             }
@@ -1235,7 +1266,18 @@ int main(int argc, char **argv) try {
                 vector<Vector3d> src = src0, dst = dst0;
                 downsample(src, 8000); downsample(dst, 8000);
                 double maxDist2 = 30.0 * 30.0;
+
+                Matrix4d bestT = Tinout;
+                double minRmse = std::numeric_limits<double>::max();
+
+                double initialRmse = computeNearestNeighborRMSE(src0, dst0, Tinout, 30.0);
+                if(initialRmse >= 0) {
+                    minRmse = initialRmse;
+                    cout << "Initial RMSE: " << minRmse << " mm" << endl;
+                }
+
                 for(int iter = 0; iter < 20; ++iter) {
+                    cout << "ICP Iteration [" << iter + 1 << "/20]" << endl;
                     vector<Vector3d> s, d;
                     // transform src by Tinout
                     for(const auto &p: src) {
@@ -1285,7 +1327,21 @@ int main(int argc, char **argv) try {
                     Vector3d t = cd - R * cs;
                     Matrix4d dT = Matrix4d::Identity(); dT.block<3, 3>(0, 0) = R; dT.block<3, 1>(0, 3) = t;
                     Tinout = dT * Tinout;
+
+                    double currentRmse = computeNearestNeighborRMSE(src0, dst0, Tinout, 30.0);
+
+                    if((iter + 1) % 2 == 0 && currentRmse >= 0) {
+                        cout << "  - RMSE at iteration " << iter + 1 << ": " << currentRmse << " mm" << endl;
+                    }
+
+                    if(currentRmse >= 0 && currentRmse < minRmse) {
+                        minRmse = currentRmse;
+                        bestT = Tinout;
+                        cout << "  - New best RMSE found: " << minRmse << " mm" << endl;
+                    }
                 }
+                Tinout = bestT;
+                cout << "\nICP refinement finished. Best RMSE: " << minRmse << " mm" << endl;
             };
 
             // ICP 정련 (전체 포인트클라우드 사용)
@@ -1296,7 +1352,7 @@ int main(int argc, char **argv) try {
             cout << T << endl;
 
             // RMSE 계산 (중심점 기반)
-            double rmse = 0; for(size_t j = 0; j < target.centers.size(); j++) { Vector4d p(target.centers[j](0), target.centers[j](1), target.centers[j](2), 1); Vector4d q = T * p; Vector3d diff = q.head<3>() - ref.centers[j]; rmse += diff.squaredNorm(); } rmse = sqrt(rmse / std::max<size_t>(1, target.centers.size()));
+            double rmse = 0; for(size_t j = 0; j < target.innerCornerPoints3D.size(); j++) { Vector4d p(target.innerCornerPoints3D[j](0), target.innerCornerPoints3D[j](1), target.innerCornerPoints3D[j](2), 1); Vector4d q = T * p; Vector3d diff = q.head<3>() - ref.innerCornerPoints3D[j]; rmse += diff.squaredNorm(); } rmse = sqrt(rmse / std::max<size_t>(1, target.innerCornerPoints3D.size()));
             cout << "RMSE: " << rmse << " mm" << endl;
 
             string filename = "Transform_" + target.serial + "_to_" + ref.serial + "_" + nowTimestamp() + ".txt";
